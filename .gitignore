@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.pyw
+*.pyz
+*.pywz
+*.pyzz
+*.egg-info/
+*.egg
+dist/
+build/
+.venv/
+venv/
+poetry.lock
+.pytest_cache/
+
+# Editors / tools
+.vscode/
+.ruff_cache/
+.worktrees/
+*bak*
+*.log
+.DS_Store
+
+# Project-specific
+.assets
+.env
+env/*.env
+!env/example.env
+docs/
+*.spec
+*api.json
+todo*
+*.db
+*.log
+logs/
+
+# Runtime data (skills and apps under .zgraph are kept)
+.zgraph
+!.zgraph/apps/exam-plan/*
+!.zgraph/skills/weather/SKILL.md

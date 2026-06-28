@@ -7,7 +7,7 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 from zgraph.config import Settings
-from zgraph.core.provider import build_chat_model
+from zgraph.core.provider import build_chat_model_with_fallback
 from zgraph.workflow.base import WorkflowResult
 from zgraph.workflow.service.structured import coerce_model_output, extract_json_object
 
@@ -72,7 +72,7 @@ class FixWorkflow:
         return WorkflowResult(self.name, "completed", payload)
 
     def _run_llm(self, state: dict[str, Any], *, target: str) -> FixWorkflowOutput:
-        model = build_chat_model(self.settings)
+        model = build_chat_model_with_fallback(self.settings)
         messages = [
             {"role": "system", "content": FIX_SYSTEM_PROMPT},
             {"role": "user", "content": json.dumps(_llm_payload(state, target), ensure_ascii=False)},

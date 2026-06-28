@@ -9,7 +9,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field
 
 from zgraph.config import Settings
-from zgraph.core.provider import build_chat_model
+from zgraph.core.provider import build_chat_model_with_fallback
 from zgraph.core.tokenizer.word import WordTokenizer
 from zgraph.workflow.base import WorkflowResult
 from zgraph.workflow.service.structured import coerce_model_output, extract_json_object
@@ -115,7 +115,7 @@ class IntentWorkflow:
     def _run_llm(self, user_input: str) -> tuple[IntentWorkflowOutput, str]:
         if self.settings is None:
             raise RuntimeError("settings are required for LLM intent workflow")
-        model = build_chat_model(self.settings)
+        model = build_chat_model_with_fallback(self.settings)
         messages = [
             {"role": "system", "content": INTENT_SYSTEM_PROMPT},
             {"role": "user", "content": user_input},

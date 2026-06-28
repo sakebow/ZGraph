@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any, Sequence
 
 from zgraph.config import Settings
-from zgraph.core.provider import build_chat_model
+from zgraph.core.provider import build_chat_model_with_fallback
 from zgraph.core.tool.base import RuntimeTool
 
 
@@ -27,7 +27,7 @@ class AgentFactory:
             """
         from langchain.agents import create_agent
 
-        model = build_chat_model(self.settings)
+        model = build_chat_model_with_fallback(self.settings)
         langchain_tools = [tool.to_langchain_tool() for tool in tools]
         return create_agent(
             model=model,

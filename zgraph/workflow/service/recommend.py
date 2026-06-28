@@ -8,7 +8,7 @@ from pydantic import BaseModel, Field
 
 from zgraph.config import Settings
 from zgraph.core.memory.loader import MemoryLoader
-from zgraph.core.provider import build_chat_model
+from zgraph.core.provider import build_chat_model_with_fallback
 from zgraph.workflow.base import WorkflowResult
 from zgraph.workflow.service.structured import coerce_model_output
 
@@ -61,7 +61,7 @@ class RecommendQuestionsWorkflow:
         return WorkflowResult(self.name, "completed", self._fallback(latest_message).model_dump())
 
     def _run_llm(self, latest_message: str) -> RecommendedQuestionsOutput:
-        model = build_chat_model(self.settings)
+        model = build_chat_model_with_fallback(self.settings)
         messages = [
             {"role": "system", "content": RECOMMEND_SYSTEM_PROMPT},
             {"role": "user", "content": f"Latest saved message:\n{latest_message}"},

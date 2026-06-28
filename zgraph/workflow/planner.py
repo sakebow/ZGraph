@@ -8,7 +8,7 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 from zgraph.config import Settings
-from zgraph.core.provider import build_chat_model
+from zgraph.core.provider import build_chat_model_with_fallback
 from zgraph.core.skills.loader import Skill
 from zgraph.core.tool.base import RuntimeTool
 from zgraph.workflow.service.structured import coerce_model_output
@@ -52,7 +52,7 @@ class TemporaryWorkflowPlanner:
                 notes="LLM workflow planning is unavailable because provider execution is offline.",
             )
 
-        model = build_chat_model(self.settings)
+        model = build_chat_model_with_fallback(self.settings)
         messages = [
             {"role": "system", "content": _planner_system_prompt()},
             {
@@ -100,7 +100,7 @@ class TemporaryWorkflowReviewer:
         if self.settings.offline or not self.settings.api_key:
             return WorkflowReviewOutput(approved=True, issues=["LLM reviewer skipped in offline mode."])
 
-        model = build_chat_model(self.settings)
+        model = build_chat_model_with_fallback(self.settings)
         messages = [
             {"role": "system", "content": _reviewer_system_prompt()},
             {

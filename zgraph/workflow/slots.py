@@ -8,7 +8,7 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 from zgraph.config import Settings
-from zgraph.core.provider import build_chat_model
+from zgraph.core.provider import build_chat_model_with_fallback
 from zgraph.workflow.base import WorkflowResult
 from zgraph.workflow.service.fix import FixWorkflow
 from zgraph.workflow.service.structured import coerce_model_output
@@ -122,7 +122,7 @@ class WorkflowSlotResolver:
             返回:
                 返回类型为 dict[str, Any] 的结果
             """
-        model = build_chat_model(self.settings)
+        model = build_chat_model_with_fallback(self.settings)
         input_payload = {
             name: {
                 "description": item.description,

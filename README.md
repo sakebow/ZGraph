@@ -75,12 +75,55 @@ POST /v1/recommendations
 
 ### LLM / 服务提供商
 
+#### 多 provider 配置（推荐）
+
+当前 ZGraph 内置支持三个 provider：`deepseek` / `kimi` / `minimax`。所有 provider 都通过 OpenAI 兼容协议接入，因此仅在 `base_url` 与默认 `model` 上做区分。
+
+```bash
+# 启用并选择默认 provider
+ZGRAPH_PROVIDERS="deepseek,kimi,minimax"
+ZGRAPH_DEFAULT_PROVIDER="deepseek"
+
+# 各 provider 的 API key
+DEEPSEEK_API_KEY="sk-..."
+KIMI_API_KEY="sk-..."
+MINIMAX_API_KEY="sk-..."
+
+# 可选：覆盖默认 base_url 或 model
+DEEPSEEK_MODEL="deepseek-chat"
+DEEPSEEK_BASE_URL="https://api.deepseek.com/v1"
+KIMI_MODEL="moonshot-v1-128k"
+MINIMAX_BASE_URL="https://api.minimax.chat/v1"
+```
+
+| 变量 | 默认值 | 说明 |
+|----------|---------|-------------|
+| `ZGRAPH_PROVIDERS` | — | 启用的 provider 列表，逗号分隔、小写，例如 `"deepseek,kimi,minimax"`。未设置时回退到旧的单 provider 模式。 |
+| `ZGRAPH_DEFAULT_PROVIDER` | `ZGRAPH_PROVIDERS` 字典序首个 | 当前默认 provider 名称。 |
+| `<PROVIDER>_API_KEY` | — | 单个 provider 的 API key，例如 `DEEPSEEK_API_KEY`。 |
+| `<PROVIDER>_MODEL` | 见下表 | 单个 provider 的默认 model，可被环境变量覆盖。 |
+| `<PROVIDER>_BASE_URL` | 见下表 | 单个 provider 的 base URL，可被环境变量覆盖。 |
+
+默认 `base_url` 与默认 `model`：
+
+| Provider | `base_url` | `model` |
+|---|---|---|
+| `deepseek` | `https://api.deepseek.com/v1` | `deepseek-chat` |
+| `kimi` | `https://api.moonshot.cn/v1` | `moonshot-v1-8k` |
+| `minimax` | `https://api.minimax.chat/v1` | `MiniMax-Text-01` |
+
+> 默认 base_url 是从公开信息整理的，请按内部实际地址通过 `<PROVIDER>_BASE_URL` 覆盖。
+
+#### 单 provider 配置（向后兼容）
+
+若未设置 `ZGRAPH_PROVIDERS`，ZGraph 自动使用下列旧字段合成名为 `default` 的 provider：
+
 | 变量 | 默认值 | 说明 |
 |----------|---------|-------------|
 | `BASE_URL` | — | LLM 服务提供商的基础 URL。 |
 | `APIKEY` / `API_KEY` | — | LLM 服务提供商的 API key。 |
 | `LLM_MODEL_NAME` / `MODEL_NAME` | `gpt-4o-mini` | 模型名称。 |
-| `LLM_PROVIDER` | `openai` | 提供商适配器。 |
+| `LLM_PROVIDER` | `openai` | 提供商适配器（多 provider 模式下不再使用）。 |
 | `LLM_TIMEOUT` | `120` | 请求超时时间（秒）。 |
 | `LLM_TEMPERATURE` | — | 采样温度。 |
 | `LLM_TOP_P` | — | Nucleus sampling 参数。 |

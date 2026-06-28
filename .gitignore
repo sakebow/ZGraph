@@ -30,7 +30,6 @@ poetry.lock
 env/*.env
 !env/example.env
 docs/
-tests/
 *.spec
 *api.json
 todo*

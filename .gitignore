@@ -37,7 +37,15 @@ todo*
 *.log
 logs/
 
-# Runtime data (skills and apps under .zgraph are kept)
-.zgraph
-!.zgraph/apps/exam-plan/*
-!.zgraph/skills/weather/SKILL.md
+# Runtime data (.zgraph/{skills,apps,storage/examples} 下保留工程/测试文件，其余为运行时数据)
+# 用 `/*` 而不是裸目录名，让 `!` 例外能重新引入子目录
+#
+# gitignore 限制：! 不能 unignore "父目录被排除"的深层路径，必须逐层 unignore 到目标；
+# 因此 unignore `.zgraph/storage/examples/` 必须先 unignore `.zgraph/storage/`，
+# 这意味着 storage 下任何子目录都会同时被 unignore（如果不想进，需在下面显式重 ignore）。
+.zgraph/*
+!.zgraph/apps
+!.zgraph/apps/exam-plan
+!.zgraph/apps/exam-plan/**
+!.zgraph/skills
+!.zgraph/skills/**

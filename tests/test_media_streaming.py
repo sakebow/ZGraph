@@ -33,12 +33,13 @@ from zgraph.runtime.events import (
 pytestmark = pytest.mark.integration
 
 
-# 用户提供的真实图片（2.4MB PNG）
+# 用户提供的真实图片（2.4MB PNG）。
+# 放在 storage/examples/ 下作为共享 fixture，不属于任何 run 的 outputs。
 SAMPLE_IMAGE = (
     Path(__file__).resolve().parents[1]
     / ".zgraph"
     / "storage"
-    / "cfe0b72bebdd40a9a0b5b4a1bc8dc9ea"
+    / "examples"
     / "140037382_p0.png"
 )
 

@@ -1,0 +1,210 @@
+name: exam-plan
+version: "1"
+mode: sequential
+skill: exam-plan
+description: Strict workflow for creating an exam plan through question bank, question, paper, import, publish, and plan creation.
+
+inputs:
+  bankName:
+    required: true
+    auto_fix: true
+    description: 题库名称
+    auto_fix_hint: 根据用户请求中的考试主题生成简短题库名，字数小于12个字符；必须包含用户主题，不要复制提示词示例或使用无关主题。
+    aliases: [题库名, 题库名称, bankName]
+  questionContent:
+    required: true
+    auto_fix: true
+    description: 题干
+    auto_fix_hint: 根据用户请求中的考试主题生成一道单选题题干；题目应清晰、可回答，且必须与用户主题一致。
+    aliases: [题干, 题目, questionContent]
+  questionOptions:
+    required: true
+    auto_fix: true
+    description: 单选题选项列表
+    auto_fix_hint: 为单选题生成4个选项；每项包含 optionCode、optionContent、isCorrect、sortOrder；isCorrect 必须使用整数 1 或 0，不能使用 true 或 false；只能有一个 isCorrect 为 1。
+    aliases: [选项, 答案选项, questionOptions]
+    schema:
+      type: array
+      min_items: 2
+      item:
+        type: object
+        required: [optionCode, optionContent, isCorrect, sortOrder]
+        properties:
+          optionCode:
+            type: string
+          optionContent:
+            type: string
+          isCorrect:
+            type: integer
+            enum: [0, 1]
+          sortOrder:
+            type: integer
+  score:
+    required: false
+    default: 10
+    description: 题目分值
+    aliases: [分值, score]
+  paperName:
+    required: true
+    auto_fix: true
+    description: 试卷名称
+    auto_fix_hint: 根据用户请求中的考试主题生成简短试卷名；必须包含用户主题，不要使用无关主题。
+    aliases: [试卷名, 试卷名称, paperName]
+  examName:
+    required: true
+    auto_fix: true
+    description: 考试计划名称
+    auto_fix_hint: 根据用户请求中的考试主题生成简短考试计划名；必须包含用户主题，不要使用无关主题。
+    aliases: [计划名, 考试名, 考试计划名, examName]
+  coverUrl:
+    required: false
+    default: https://image.cnzbai.com/cover/kaoshi.png
+    description: 考试封面地址
+    aliases: [考试封面, 封面地址, coverUrl]
+  storeId:
+    required: false
+    default: TEST_STORE_ID
+    description: 门店ID
+    aliases: [门店ID, 门店id, storeId]
+  storeName:
+    required: false
+    default: 默认门店
+    description: 门店名称
+    aliases: [门店名, 门店名称, storeName]
+  limitTimes:
+    required: false
+    default: -1
+    description: 限制考试次数
+    aliases: [考试次数, limitTimes]
+  limitMinutes:
+    required: false
+    default: 60
+    description: 限制考试分钟数
+    aliases: [考试时长, 分钟数, limitMinutes]
+
+steps:
+  - id: get_current_time
+    type: tool
+    tool: datetime
+    args:
+      format: "YYYY-MM-DD HH:mm:ss"
+    outputs:
+      CURRENT_TIME: content
+    assert:
+      - CURRENT_TIME exists
+
+  - id: create_bank
+    type: tool
+    tool: adapter.call
+    needs: [get_current_time]
+    args:
+      app: exam-plan
+      adapter: zbzn.exam
+      action: create_bank
+      timeout_seconds: 60
+      params:
+        bankName: "{{ inputs.bankName }}"
+    outputs:
+      BANK_ID: data.bankId
+    assert:
+      - BANK_ID exists
+    retries: 1
+
+  - id: create_question
+    type: tool
+    tool: adapter.call
+    needs: [create_bank]
+    args:
+      app: exam-plan
+      adapter: zbzn.exam
+      action: create_question
+      timeout_seconds: 60
+      params:
+        bankId: "{{ BANK_ID }}"
+        questionType: 1
+        content: "{{ inputs.questionContent }}"
+        options: "{{ inputs.questionOptions }}"
+        score: "{{ inputs.score }}"
+    outputs:
+      QUESTION_ID: data.questionId
+    assert:
+      - QUESTION_ID exists
+    retries: 1
+
+  - id: create_paper
+    type: tool
+    tool: adapter.call
+    needs: [create_question]
+    args:
+      app: exam-plan
+      adapter: zbzn.exam
+      action: create_paper
+      timeout_seconds: 60
+      params:
+        paperName: "{{ inputs.paperName }}"
+    outputs:
+      PAPER_ID: data.paperId
+    assert:
+      - PAPER_ID exists
+    retries: 1
+
+  - id: import_question
+    type: tool
+    tool: adapter.call
+    needs: [create_paper]
+    args:
+      app: exam-plan
+      adapter: zbzn.exam
+      action: import_question
+      timeout_seconds: 60
+      params:
+        paperId: "{{ PAPER_ID }}"
+        questionId: "{{ QUESTION_ID }}"
+        score: "{{ inputs.score }}"
+        sortOrder: 1
+    outputs:
+      IMPORT_OK: data.imported
+    assert:
+      - IMPORT_OK == true
+    retries: 1
+
+  - id: publish_paper
+    type: tool
+    tool: adapter.call
+    needs: [import_question]
+    args:
+      app: exam-plan
+      adapter: zbzn.exam
+      action: publish_paper
+      timeout_seconds: 60
+      params:
+        paperId: "{{ PAPER_ID }}"
+    outputs:
+      PUBLISH_OK: data.published
+    assert:
+      - PUBLISH_OK == true
+    retries: 1
+
+  - id: create_exam_plan
+    type: tool
+    tool: adapter.call
+    needs: [publish_paper]
+    args:
+      app: exam-plan
+      adapter: zbzn.exam
+      action: create_plan
+      timeout_seconds: 60
+      params:
+        examName: "{{ inputs.examName }}"
+        sourcePaperId: "{{ PAPER_ID }}"
+        coverUrl: "{{ inputs.coverUrl }}"
+        limitTimes: "{{ inputs.limitTimes }}"
+        limitMinutes: "{{ inputs.limitMinutes }}"
+        storeId: "{{ inputs.storeId }}"
+        storeName: "{{ inputs.storeName }}"
+        targetType: 2
+    outputs:
+      PLAN_ID: data.planId
+    assert:
+      - PLAN_ID exists
+    retries: 1

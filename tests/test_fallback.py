@@ -96,6 +96,7 @@ def _settings_with(
         legacy_provider=legacy_provider,
         tmp_store_path=Path("./storage"),
         media_ttl_seconds=3600,
+        media_cleanup_interval_seconds=300,
     )
     return s
 

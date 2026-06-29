@@ -4,7 +4,8 @@
 - RuntimeHook 是 callable，签名 ``async def __call__(event, ctx) -> RuntimeEvent | None``
 - 可以在事件流上观察、修改、或丢弃（return None）事件
 - 异常隔离：单个 hook 抛错不会影响主流程
-- 默认钩子（AuditHook / MetricsHook / PIIFilterHook）随 Runtime 一同注册
+- 默认钩子（AuditHook / MetricsHook / PIIFilterHook / GuardianHook）通过
+  ``default_hooks()`` 工厂方法获取，注册表在 ``registry.py``
 """
 
 from __future__ import annotations
@@ -55,3 +56,8 @@ class RuntimeHook(Protocol):
         self, event: "RuntimeEvent", ctx: RunContext
     ) -> "RuntimeEvent | None":
         ...
+
+
+# 顶层 re-export 方便 ``from zgraph.runtime.hooks import default_hooks``
+from zgraph.runtime.hooks.registry import default_hooks  # noqa: E402, F401
+

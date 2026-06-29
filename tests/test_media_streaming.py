@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 from pathlib import Path
 from typing import AsyncIterator
 
@@ -31,17 +30,6 @@ from zgraph.runtime.events import (
 
 
 pytestmark = pytest.mark.integration
-
-
-# 用户提供的真实图片（2.4MB PNG）。
-# 放在 storage/examples/ 下作为共享 fixture，不属于任何 run 的 outputs。
-SAMPLE_IMAGE = (
-    Path(__file__).resolve().parents[1]
-    / ".zgraph"
-    / "storage"
-    / "examples"
-    / "140037382_p0.png"
-)
 
 
 def _build_event_stream(
@@ -78,11 +66,13 @@ def _build_event_stream(
 class TestMediaStreamingPipeline:
     def test_sample_image_exists(self) -> None:
         """前置检查：用户提供的真实 PNG 必须存在。"""
+        from tests.conftest import SAMPLE_IMAGE
+
         assert SAMPLE_IMAGE.exists(), f"missing sample image: {SAMPLE_IMAGE}"
         assert SAMPLE_IMAGE.stat().st_size > 0
 
     async def test_full_pipeline_with_real_image(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+        self, tmp_path, monkeypatch: pytest.MonkeyPatch, sample_png: bytes
     ) -> None:
         """端到端：真实 PNG → media_store → SSE chunk，验证 URL 可访问。"""
         # 把 storage 路径指到 tmp_path，不污染真实目录
@@ -90,8 +80,7 @@ class TestMediaStreamingPipeline:
         monkeypatch.setenv("ZGRAPH_STORAGE_PROVIDERS", "localfs")
         monkeypatch.setenv("ZGRAPH_MEDIA_BASE_URL", "http://test.local:9999")
 
-        # 1. 读真实图片字节
-        image_bytes = SAMPLE_IMAGE.read_bytes()
+        image_bytes = sample_png
         assert len(image_bytes) > 1_000_000, "expected a > 1MB PNG"
 
         # 2. Runtime 把图存进 media_store
@@ -158,14 +147,17 @@ class TestMediaStreamingPipeline:
         assert restored_bytes == image_bytes, "round-trip bytes mismatch"
         assert restored_mime == "image/png"
 
-    async def test_log_file_shows_event_order(self, tmp_path, monkeypatch) -> None:
+    async def test_log_file_shows_event_order(
+        self, tmp_path, monkeypatch, sample_png: bytes
+    ) -> None:
         """检查 media.log 的事件顺序：reasoning → content → media_ready → content → final → [DONE]。"""
         monkeypatch.setenv("ZGRAPH_TMP_STORE_PATH", str(tmp_path / "storage"))
         monkeypatch.setenv("ZGRAPH_STORAGE_PROVIDERS", "localfs")
         monkeypatch.setenv("ZGRAPH_MEDIA_BASE_URL", "http://test.local:9999")
 
+        image_bytes = sample_png
+        assert len(image_bytes) > 1000
         rt = ZGraphRuntime(Settings.from_env())
-        image_bytes = b"\x89PNG\r\n\x1a\n" + b"\x00" * 100  # 假 PNG 头
         media_event = rt.emit_media(
             run_id="order-test",
             modality="image",

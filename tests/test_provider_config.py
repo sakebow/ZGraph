@@ -305,6 +305,7 @@ class TestResolveProvider:
             legacy_provider=None,
             tmp_store_path=Path("./storage"),
             media_ttl_seconds=3600,
+            media_cleanup_interval_seconds=300,
         )
         with pytest.raises(ValueError, match="No default provider"):
             resolve_provider(s_no_default)

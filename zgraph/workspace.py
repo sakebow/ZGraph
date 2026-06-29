@@ -32,6 +32,13 @@ class RunWorkspace:
     root: Path
     run_id: str
 
+    # Phase 3.4 收尾：媒体 + 工作流产物的统一根目录。
+    # 默认等于 ``settings.tmp_store_path``；由 ``WorkspaceManager`` 注入，
+    # 这里只是承接。把它和 ``root`` 解耦，避免 ``storage_dir`` 写死到
+    # ``zgraph_home/storage``（这样 ``ZGRAPH_TMP_STORE_PATH`` 一改，``storage_dir``
+    # 就会和 media_store 写到的位置分家）。
+    storage_root: Path | None = None
+
     @property
     def run_dir(self) -> Path:
         """运行目录"""
@@ -66,9 +73,15 @@ class RunWorkspace:
     def storage_dir(self) -> Path:
         """Phase 3：媒体 + 工作流产物的统一目录。
 
-        位置：``{root}/storage/{run_id}/``。替代了旧的 ``runs/{run_id}/outputs/``。
+        位置：``{storage_root}/{run_id}/``（默认 ``storage_root = zgraph_home/storage``，
+        即 ``tmp_store_path`` 默认值）。这样 ``MediaStorage`` 写文件的位置和
+        ``workspace.storage_dir`` 永远一致。
+
+        不再用 ``zgraph_home/storage/{run_id}/`` 的硬编码形式 — 让
+        ``ZGRAPH_TMP_STORE_PATH`` 覆盖时也对得上。
         """
-        return self.root / "storage" / self.run_id
+        base = self.storage_root if self.storage_root is not None else self.root / "storage"
+        return base / self.run_id
 
     # 向后兼容别名：旧代码引用 outputs_dir 的地方仍然可用，但实际指向 storage_dir
     @property
@@ -104,17 +117,23 @@ class RunWorkspace:
 class WorkspaceManager:
 
     """工作空间管理器。"""
-    def __init__(self, root: Path) -> None:
+    def __init__(self, root: Path, *, storage_root: Path | None = None) -> None:
         """初始化实例属性。
 
             参数:
-                root: 根（Path）
+                root: 根（Path）。
+                storage_root: 媒体 + 工作流产物的统一根目录（默认 ``root/storage``）。
+                    传 ``None`` 时回退到 ``root/storage``，与 ``settings.tmp_store_path``
+                    默认值一致。
             """
         self.root = root.expanduser()
+        self.storage_root = (
+            storage_root.expanduser() if storage_root is not None else self.root / "storage"
+        )
 
     def create_run(self, run_id: str | None = None) -> RunWorkspace:
         run_id = run_id or uuid.uuid4().hex
-        return RunWorkspace(self.root, run_id).create()
+        return RunWorkspace(self.root, run_id, storage_root=self.storage_root).create()
 
     def cleanup_expired(self, ttl_seconds: int) -> list[Path]:
         runs_dir = self.root / "runs"

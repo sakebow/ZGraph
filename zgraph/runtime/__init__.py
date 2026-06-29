@@ -5,7 +5,7 @@ import json
 import logging
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, AsyncIterator
 
 from zgraph.capability import CapabilityCompiler
@@ -15,6 +15,7 @@ from zgraph.core.agent.runner import AgentResult
 from zgraph.runtime.events import (
     ContentDelta,
     Final,
+    Interrupt,
     MediaReady,
     ReasoningDelta,
     RuntimeEvent,
@@ -109,7 +110,13 @@ class ZGraphRuntime:
             hooks: RuntimeHook 列表，按声明顺序串联在事件流上（list | None）。
         """
         self.settings = settings or Settings.from_env()
-        self.workspace_manager = WorkspaceManager(self.settings.zgraph_home)
+        # Phase 3.4 收尾：storage_root 与 media_store 写到同一棵目录树（默认
+        # settings.tmp_store_path），避免 ``workspace.storage_dir`` 写文件而
+        # ``emit_media`` 写到别处的分家问题。
+        self.workspace_manager = WorkspaceManager(
+            self.settings.zgraph_home,
+            storage_root=self.settings.tmp_store_path,
+        )
         self.agent_manager = AgentManager(self.settings)
         self.intent_workflow = IntentWorkflow(self.settings)
         self.validate_workflow = ValidateWorkflow()
@@ -124,25 +131,20 @@ class ZGraphRuntime:
         self.memory_saver = JsonlMemorySaver(self.memory_path)
         self.recommend_workflow = RecommendQuestionsWorkflow(self.settings, self.memory_loader)
         self.memory_compressor = MemoryCompressor()
-        # Phase 2：默认注册一组 built-in hooks。延迟导入避免循环依赖。
-        from zgraph.runtime.hooks.builtin import (
-            AuditHook,
-            MetricsHook,
-            PIIFilterHook,
-        )
-        from zgraph.runtime.hooks.guardian_hook import GuardianHook
+        # Phase 2.3：默认钩子链走 registry.py，便于统一管理和测试。
+        # 不传 hooks= 时，Runtime 会自动用 ``default_hooks()`` 初始化。
+        from zgraph.runtime.hooks.registry import default_hooks
 
-        self.hooks: list[Any] = list(hooks) if hooks else [
-            AuditHook(),
-            MetricsHook(),
-            PIIFilterHook(),
-            GuardianHook(),
-        ]
+        self.hooks: list[Any] = list(hooks) if hooks is not None else default_hooks()
 
         # Phase 3：媒体存储
         from zgraph.runtime.media_storage import get_media_storage
 
         self.media_store = get_media_storage(self.settings)
+        # Phase 3.5：per-run 待聚合 MediaReady 事件缓存。
+        # ``emit_media(run_id=...)`` 把事件压入此 dict；``astream()`` 在收尾时
+        # 把它消费掉，yield MediaReady + 写进 RuntimeResult.media，然后清空。
+        self._pending_media: dict[str, list[MediaReady]] = {}
 
         self.logger = logging.getLogger("zgraph")
         self._configure_logging()
@@ -218,78 +220,188 @@ class ZGraphRuntime:
             started_at=time.time(),
         )
 
-        async def _emit(event: "RuntimeEvent") -> None:
-            """事件过 hook 链后 yield。"""
-            processed = await self._apply_hooks(event, ctx)
-            if processed is not None:
-                yield processed
-
         async def _gen():
-            """内部 generator，把所有 yield 集中在一处。"""
-            # —— 1. sync pre-flight：setup / intent / capability ——
-            try:
-                context = ToolContext(workspace=workspace, allow_bash=self.settings.allow_bash)
-                tool_registry = build_default_tool_registry(context)
-                skills = SkillLoader(self._skill_dirs()).load()
-                state: dict[str, Any] = {
-                    "run_id": workspace.run_id,
-                    "user_input": user_input,
-                    "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                }
-                intent_result = self.intent_workflow.run(state)
-                state.update(intent_result.data)
-                compiler = CapabilityCompiler(self.settings, tool_registry, skills)
-                capabilities = compiler.compile(state)
-                state["capabilities"] = capabilities
-            except Exception as exc:
-                yield self._failed_final(workspace.run_id, f"setup failed: {exc}")
-                return
+            """内部 generator，把所有 yield 集中在一处。
 
-            # —— 2. Guardian（同步；interrupted 路径 emit Final 而非走 stream）——
-            interrupt: dict[str, Any] | None = None
-            if capabilities.get("risk_level") in {"medium", "high"}:
-                validation = self.validate_workflow.run(state)
-                if validation.status != "completed":
-                    yield self._failed_final(
+            用 try/finally 兜底：所有路径（成功 / 失败 / interrupted / 异常）
+            都会把 ``_pending_media[workspace.run_id]`` 弹掉，避免内存泄漏。
+            失败路径在 yield _failed_final 前先把累积的 media events 一起 yield
+            出去（通过 ``_with_pending_media`` 附加到 Final.runtime_result.media）。
+            """
+            try:
+                # —— 1. sync pre-flight：setup / intent / capability ——
+                try:
+                    context = ToolContext(
+                        workspace=workspace,
+                        allow_bash=self.settings.allow_bash,
+                        emit_media=self._make_emit_media(workspace.run_id),
+                        metadata={"zgraph_home": str(self.settings.zgraph_home)},
+                    )
+                    tool_registry = build_default_tool_registry(context)
+                    skills = SkillLoader(self._skill_dirs()).load()
+                    state: dict[str, Any] = {
+                        "run_id": workspace.run_id,
+                        "user_input": user_input,
+                        "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    }
+                    intent_result = self.intent_workflow.run(state)
+                    state.update(intent_result.data)
+                    compiler = CapabilityCompiler(self.settings, tool_registry, skills)
+                    capabilities = compiler.compile(state)
+                    state["capabilities"] = capabilities
+                except Exception as exc:
+                    yield self._with_pending_media(
+                        self._failed_final(workspace.run_id, f"setup failed: {exc}"),
                         workspace.run_id,
-                        "; ".join(validation.errors) or "Guardian validation failed",
-                        state=state,
-                        capabilities=capabilities,
                     )
                     return
-                risk = self.risk_workflow.run(state)
-                capabilities["risk_level"] = risk.data["risk_level"]
-                state["risk_level"] = capabilities["risk_level"]
-                approval = self.approve_workflow.run(state)
-                if approval.status == "interrupted":
-                    interrupt = approval.data["interrupt"]
-                    if not self.settings.auto_approve_interrupts:
-                        yield Final(
+
+                # —— 2. Guardian（同步；interrupted 路径 emit Final 而非走 stream）——
+                interrupt: dict[str, Any] | None = None
+                if capabilities.get("risk_level") in {"medium", "high"}:
+                    validation = self.validate_workflow.run(state)
+                    if validation.status != "completed":
+                        yield self._with_pending_media(
+                            self._failed_final(
+                                workspace.run_id,
+                                "; ".join(validation.errors) or "Guardian validation failed",
+                                state=state,
+                                capabilities=capabilities,
+                            ),
+                            workspace.run_id,
+                        )
+                        return
+                    risk = self.risk_workflow.run(state)
+                    capabilities["risk_level"] = risk.data["risk_level"]
+                    state["risk_level"] = capabilities["risk_level"]
+                    approval = self.approve_workflow.run(state)
+                    if approval.status == "interrupted":
+                        interrupt = approval.data["interrupt"]
+                        if not self.settings.auto_approve_interrupts:
+                            yield self._with_pending_media(
+                                Final(
+                                    run_id=workspace.run_id,
+                                    status="interrupted",
+                                    finish_reason="interrupted",
+                                    runtime_result=RuntimeResult(
+                                        run_id=workspace.run_id,
+                                        status="interrupted",
+                                        content="High risk task requires explicit approval.",
+                                        hint=state.get("hint", {}),
+                                        intent=state.get("intent", {}),
+                                        todo=state.get("todo", []),
+                                        capabilities=capabilities,
+                                        interrupt=interrupt,
+                                        interrupt_token=interrupt.get("interrupt_id", ""),
+                                    ),
+                                ),
+                                workspace.run_id,
+                            )
+                            return
+                        interrupt["status"] = "approved"
+                        interrupt["decision_reason"] = "auto-approved by runtime policy"
+                        state["interrupt"] = interrupt
+
+                selected_tools = self._selected_tools(capabilities, tool_registry)
+
+                # —— 3. offline / 无 api_key：直接 Final ——
+                if self.settings.offline or not self.settings.api_key:
+                    offline_text = self._offline_execute(user_input, workspace, state)
+                    yield self._with_pending_media(
+                        Final(
                             run_id=workspace.run_id,
-                            status="interrupted",
-                            finish_reason="interrupted",
+                            status="completed",
+                            finish_reason="stop",
                             runtime_result=RuntimeResult(
                                 run_id=workspace.run_id,
-                                status="interrupted",
-                                content="High risk task requires explicit approval.",
+                                status="completed",
+                                content=str(offline_text),
                                 hint=state.get("hint", {}),
                                 intent=state.get("intent", {}),
                                 todo=state.get("todo", []),
                                 capabilities=capabilities,
                                 interrupt=interrupt,
-                                interrupt_token=interrupt.get("interrupt_id", ""),
                             ),
-                        )
-                        return
-                    interrupt["status"] = "approved"
-                    interrupt["decision_reason"] = "auto-approved by runtime policy"
-                    state["interrupt"] = interrupt
+                        ),
+                        workspace.run_id,
+                    )
+                    return
 
-            selected_tools = self._selected_tools(capabilities, tool_registry)
+                # —— 4. 真流式：LangChain astream_events ——
+                try:
+                    agent = self.agent_manager.factory.create(
+                        selected_tools,
+                        system_prompt=self._system_prompt_with_skills(state, skills),
+                    )
+                except Exception as exc:
+                    yield self._with_pending_media(
+                        self._failed_final(workspace.run_id, f"agent create failed: {exc}"),
+                        workspace.run_id,
+                    )
+                    return
 
-            # —— 3. offline / 无 api_key：直接 Final ——
-            if self.settings.offline or not self.settings.api_key:
-                offline_text = self._offline_execute(user_input, workspace, state)
+                content_parts: list[str] = []
+                reasoning_parts: list[str] = []
+                try:
+                    async for lc_event in agent.astream_events(
+                        {"messages": [{"role": "user", "content": user_input}]},
+                        version="v2",
+                    ):
+                        kind = lc_event.get("event")
+                        if kind == "on_chat_model_stream":
+                            chunk = lc_event.get("data", {}).get("chunk")
+                            if chunk is None:
+                                continue
+                            text = getattr(chunk, "content", "") or ""
+                            if text:
+                                content_parts.append(text)
+                                yield ContentDelta(text=text)
+                            extra = getattr(chunk, "additional_kwargs", None) or {}
+                            reasoning = extra.get("reasoning_content", "") or ""
+                            if reasoning:
+                                reasoning_parts.append(reasoning)
+                                yield ReasoningDelta(text=reasoning)
+                        elif kind == "on_tool_start":
+                            yield ToolCallStart(
+                                tool_call_id=str(lc_event.get("run_id", "")),
+                                tool_name=str(lc_event.get("name", "")),
+                            )
+                        elif kind == "on_tool_end":
+                            yield ToolCallEnd(
+                                tool_call_id=str(lc_event.get("run_id", "")),
+                                tool_name=str(lc_event.get("name", "")),
+                                result=lc_event.get("data", {}).get("output"),
+                                is_error=lc_event.get("data", {}).get("error") is not None,
+                            )
+                except Exception as exc:
+                    yield self._with_pending_media(
+                        self._failed_final(workspace.run_id, f"streaming execution failed: {exc}"),
+                        workspace.run_id,
+                    )
+                    return
+
+                full_content = "".join(content_parts)
+                full_reasoning = "".join(reasoning_parts)
+
+                # —— 5. Phase 3.5：弹出 per-run 待聚合的 MediaReady 事件 ——
+                # 在 Final 之前逐条 yield，让客户端按事件流收到 URL；
+                # 同时把全部事件的 dict 形态塞进 RuntimeResult.media，给同步消费者。
+                media_events = self._consume_media(workspace.run_id)
+                for media_event in media_events:
+                    yield media_event
+
+                # —— 6. 持久化 conversation.json（offload 到 executor，避免阻塞 event loop）——
+                try:
+                    loop = asyncio.get_running_loop()
+                    await loop.run_in_executor(
+                        None,
+                        lambda: self._write_streaming_conversation(
+                            workspace, user_input, full_content, full_reasoning
+                        ),
+                    )
+                except Exception:
+                    pass  # 持久化失败不影响最终事件
+
                 yield Final(
                     run_id=workspace.run_id,
                     status="completed",
@@ -297,94 +409,20 @@ class ZGraphRuntime:
                     runtime_result=RuntimeResult(
                         run_id=workspace.run_id,
                         status="completed",
-                        content=str(offline_text),
+                        content=full_content,
                         hint=state.get("hint", {}),
                         intent=state.get("intent", {}),
                         todo=state.get("todo", []),
                         capabilities=capabilities,
                         interrupt=interrupt,
+                        reasoning_content=full_reasoning,
+                        media=[m.to_dict() for m in media_events],
                     ),
                 )
-                return
-
-            # —— 4. 真流式：LangChain astream_events ——
-            try:
-                agent = self.agent_manager.factory.create(
-                    selected_tools,
-                    system_prompt=self._system_prompt_with_skills(state, skills),
-                )
-            except Exception as exc:
-                yield self._failed_final(workspace.run_id, f"agent create failed: {exc}")
-                return
-
-            content_parts: list[str] = []
-            reasoning_parts: list[str] = []
-            try:
-                async for lc_event in agent.astream_events(
-                    {"messages": [{"role": "user", "content": user_input}]},
-                    version="v2",
-                ):
-                    kind = lc_event.get("event")
-                    if kind == "on_chat_model_stream":
-                        chunk = lc_event.get("data", {}).get("chunk")
-                        if chunk is None:
-                            continue
-                        text = getattr(chunk, "content", "") or ""
-                        if text:
-                            content_parts.append(text)
-                            yield ContentDelta(text=text)
-                        extra = getattr(chunk, "additional_kwargs", None) or {}
-                        reasoning = extra.get("reasoning_content", "") or ""
-                        if reasoning:
-                            reasoning_parts.append(reasoning)
-                            yield ReasoningDelta(text=reasoning)
-                    elif kind == "on_tool_start":
-                        yield ToolCallStart(
-                            tool_call_id=str(lc_event.get("run_id", "")),
-                            tool_name=str(lc_event.get("name", "")),
-                        )
-                    elif kind == "on_tool_end":
-                        yield ToolCallEnd(
-                            tool_call_id=str(lc_event.get("run_id", "")),
-                            tool_name=str(lc_event.get("name", "")),
-                            result=lc_event.get("data", {}).get("output"),
-                            is_error=lc_event.get("data", {}).get("error") is not None,
-                        )
-            except Exception as exc:
-                yield self._failed_final(workspace.run_id, f"streaming execution failed: {exc}")
-                return
-
-            full_content = "".join(content_parts)
-            full_reasoning = "".join(reasoning_parts)
-
-            # —— 5. 持久化 conversation.json（offload 到 executor，避免阻塞 event loop）——
-            try:
-                loop = asyncio.get_event_loop()
-                await loop.run_in_executor(
-                    None,
-                    lambda: self._write_streaming_conversation(
-                        workspace, user_input, full_content, full_reasoning
-                    ),
-                )
-            except Exception:
-                pass  # 持久化失败不影响最终事件
-
-            yield Final(
-                run_id=workspace.run_id,
-                status="completed",
-                finish_reason="stop",
-                runtime_result=RuntimeResult(
-                    run_id=workspace.run_id,
-                    status="completed",
-                    content=full_content,
-                    hint=state.get("hint", {}),
-                    intent=state.get("intent", {}),
-                    todo=state.get("todo", []),
-                    capabilities=capabilities,
-                    interrupt=interrupt,
-                    reasoning_content=full_reasoning,
-                ),
-            )
+            finally:
+                # Defensive: 即便上面某个 yield 抛异常（罕见，比如 hook 抛错冒上来），
+                # 也要保证 _pending_media 不残留。否则长跑 server 累积内存泄漏。
+                self._pending_media.pop(workspace.run_id, None)
 
         # 用 async generator 代理 _gen()，每个事件过 _apply_hooks 后再 yield
         async for event in _gen():
@@ -475,7 +513,7 @@ class ZGraphRuntime:
             "%Y-%m-%dT%H:%M:%SZ",
             time.gmtime(time.time() + self.settings.media_ttl_seconds),
         )
-        return MediaReady(
+        event = MediaReady(
             block_id=block_id,
             modality=modality,
             mime=mime,
@@ -484,6 +522,68 @@ class ZGraphRuntime:
             metadata=dict(metadata or {}),
             expires_at=expires_at,
         )
+        # Phase 3.5：压入 per-run 队列，等 astream() 收尾时聚合。
+        # run_id 通常是 UUID，重入概率极低；如果发生，追加到现有 list。
+        self._pending_media.setdefault(run_id, []).append(event)
+        return event
+
+    def _consume_media(self, run_id: str) -> list[MediaReady]:
+        """astream() 收尾时调用：弹出该 run 的所有 MediaReady 事件。
+
+        返回:
+            该 run 期间累积的所有 MediaReady；并清空队列。
+        """
+        return self._pending_media.pop(run_id, [])
+
+    def _with_pending_media(self, final: "Final", run_id: str) -> "Final":
+        """把 ``_pending_media[run_id]`` 弹出并塞进 ``final.runtime_result.media``。
+
+        用于 _gen() 各失败 / interrupted 路径：在 yield Final 之前调用，
+        把工具已经 emit 但未 yield 给客户端的 MediaReady 事件附加上去。
+        若 final 没有 runtime_result 或 pending 为空，则原样返回。
+
+        返回:
+            携带 media 字段的 Final 事件（runtime_result 是新对象）。
+        """
+        if final.runtime_result is None:
+            return final
+        media_events = self._consume_media(run_id)
+        if not media_events:
+            return final
+        return replace(
+            final,
+            runtime_result=replace(
+                final.runtime_result,
+                media=[m.to_dict() for m in media_events],
+            ),
+        )
+
+    def _make_emit_media(self, run_id: str):
+        """构造绑定到指定 run_id 的 emit_media 回调，供 ToolContext 使用。
+
+        tools 在 ``self.context.emit_media(...)`` 调用时，会触发 media_store.put
+        并把 MediaReady 事件压入 ``runtime._pending_media[run_id]``，等 astream
+        收尾时统一 yield。
+        """
+
+        def _emit(
+            *,
+            modality: str,
+            mime: str,
+            data: bytes,
+            name: str,
+            metadata: dict[str, Any] | None = None,
+        ) -> MediaReady:
+            return self.emit_media(
+                run_id=run_id,
+                modality=modality,
+                mime=mime,
+                data=data,
+                name=name,
+                metadata=metadata,
+            )
+
+        return _emit
 
     def cleanup_expired_media(self) -> int:
         """Phase 3.7：清理过期媒体，返回删除条数。"""
@@ -492,6 +592,68 @@ class ZGraphRuntime:
         except Exception as exc:
             self.logger.warning("media cleanup failed: %s", exc)
             return 0
+
+    def list_available_examples(self) -> list[str]:
+        """扫描 ``<zgraph_home>/storage/examples/``，返回可用媒体文件路径列表。
+
+        给上层（HTTP/CLI handler）拼 system hint 用，让 LLM 看到 examples 目录里
+        的本地文件路径，从而在收到「发我一张图片」这类模糊 prompt 时知道可以调
+        ``media_input(path=...)`` 加载哪一张。
+
+        返回绝对路径字符串列表，按文件名排序；目录不存在或为空时返回 ``[]``。
+        """
+        examples_dir = self.settings.zgraph_home / "storage" / "examples"
+        if not examples_dir.is_dir():
+            return []
+        try:
+            entries = sorted(
+                entry.resolve()
+                for entry in examples_dir.iterdir()
+                if entry.is_file()
+            )
+        except OSError as exc:
+            self.logger.warning("list_available_examples failed: %s", exc)
+            return []
+        return [str(path) for path in entries]
+
+    def build_examples_hint(self) -> str:
+        """把 :meth:`list_available_examples` 拼成 system hint 文本。
+
+        没有 example 时返回空串，调用方应据此跳过注入；避免在 LLM 上下文里
+        出现空段。
+        """
+        paths = self.list_available_examples()
+        if not paths:
+            return ""
+        lines = [
+            "Available example media files (use media_input tool to attach):",
+        ]
+        lines.extend(f"- {path}" for path in paths)
+        return "\n".join(lines)
+
+    def run_via_stream(self, user_input: str, *, run_id: str | None = None) -> RuntimeResult:
+        """Phase 1.5：同步薄包装。跑 ``astream()``，用 ``StreamAggregator`` 把事件聚合成 RuntimeResult。
+
+        与 ``run()`` 的区别：
+        - ``run()`` 走 sync ``_execute`` + LangChain ``agent.invoke``，不消费事件流；
+        - ``run_via_stream()`` 走 async ``astream()``，能拿到 reasoning_content /
+          完整 tool_calls / 实时 media。
+
+        注意：因为 astream() 里用 ``asyncio.run(_drain())`` 起新 loop，**不能在已有
+        asyncio loop 的上下文里调用**（CLI 同步入口可以，HTTP server 端不行 ——
+        HTTP server 自己有 per-request loop）。
+        """
+        import asyncio
+        from zgraph.runtime.stream_aggregator import StreamAggregator
+
+        events: list[RuntimeEvent] = []
+
+        async def _drain() -> None:
+            async for event in self.astream(user_input, run_id=run_id):
+                events.append(event)
+
+        asyncio.run(_drain())
+        return StreamAggregator.collect(events)
 
     def run(self, user_input: str, *, run_id: str | None = None) -> RuntimeResult:
         workspace = self.workspace_manager.create_run(run_id)
@@ -518,7 +680,12 @@ class ZGraphRuntime:
     def _run_unprotected(self, request: dict[str, Any], workspace: RunWorkspace) -> dict[str, Any]:
         user_input = str(request.get("user_input", ""))
         self.logger.info("run_id=%s stage=setup:start", workspace.run_id)
-        context = ToolContext(workspace=workspace, allow_bash=self.settings.allow_bash)
+        context = ToolContext(
+            workspace=workspace,
+            allow_bash=self.settings.allow_bash,
+            emit_media=self._make_emit_media(workspace.run_id),
+            metadata={"zgraph_home": str(self.settings.zgraph_home)},
+        )
         tool_registry = build_default_tool_registry(context)
         skill_started = time.perf_counter()
         skills = SkillLoader(self._skill_dirs()).load()
@@ -639,7 +806,9 @@ class ZGraphRuntime:
             len(reasoning_text),
         )
         artifacts = [str(path) for path in workspace.artifacts_dir.glob("*") if path.is_file()]
-        artifacts.extend(str(path) for path in workspace.outputs_dir.glob("*") if path.is_file())
+        # Phase 3.4 收尾：不再读 ``outputs_dir``（已是 ``storage_dir`` 别名），直接
+        # 走 storage_dir。这样以后把别名砍掉也不会破。
+        artifacts.extend(str(path) for path in workspace.storage_dir.glob("*") if path.is_file())
 
         result = RuntimeResult(
             run_id=workspace.run_id,
@@ -654,6 +823,7 @@ class ZGraphRuntime:
             error=state.get("_execution_error"),
             data=state.get("_execution_data"),
             reasoning_content=reasoning_text,
+            media=[m.to_dict() for m in self._consume_media(workspace.run_id)],
         )
         self._save_memory(user_input, result)
         self.logger.info("run_id=%s stage=audit:start", workspace.run_id)
@@ -705,7 +875,7 @@ class ZGraphRuntime:
     def validate_workflows(self, *, run_id: str | None = None) -> RuntimeResult:
         """校验工作流"""
         workspace = self.workspace_manager.create_run(run_id)
-        context = ToolContext(workspace=workspace, allow_bash=False)
+        context = ToolContext(workspace=workspace, allow_bash=False, metadata={"zgraph_home": str(self.settings.zgraph_home)})
         tool_registry = build_default_tool_registry(context)
         skills = SkillLoader(self._skill_dirs()).load()
         checked: list[dict[str, Any]] = []
@@ -814,7 +984,7 @@ class ZGraphRuntime:
         state["interrupt"] = interrupt
         state["risk_level"] = state.get("capabilities", {}).get("risk_level", state.get("risk_level"))
 
-        context = ToolContext(workspace=workspace, allow_bash=True)
+        context = ToolContext(workspace=workspace, allow_bash=True, metadata={"zgraph_home": str(self.settings.zgraph_home)})
         tool_registry = build_default_tool_registry(context)
         skills = SkillLoader(self._skill_dirs()).load()
         selected_tools = self._selected_tools(state.get("capabilities", {}), tool_registry)
@@ -822,7 +992,8 @@ class ZGraphRuntime:
 
         content = self._execute(user_input, workspace, selected_tools, state, skills, tool_registry)
         artifacts = [str(path) for path in workspace.artifacts_dir.glob("*") if path.is_file()]
-        artifacts.extend(str(path) for path in workspace.outputs_dir.glob("*") if path.is_file())
+        # Phase 3.4 收尾：直接走 storage_dir
+        artifacts.extend(str(path) for path in workspace.storage_dir.glob("*") if path.is_file())
         result = RuntimeResult(
             run_id=run_id,
             status=str(state.get("_execution_status", "completed")),
@@ -1284,7 +1455,8 @@ class ZGraphRuntime:
         }
         if error:
             payload["provider_error"] = error
-        target = workspace.outputs_dir / "runtime-result.json"
+        # Phase 3.4 收尾：写入 storage_dir（不再依赖 outputs_dir 别名）
+        target = workspace.storage_dir / "runtime-result.json"
         target.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         if state.get("intent", {}).get("name") == "chat":
             return "ZGraph runtime is ready. Provider execution is offline, so I returned a local runtime response."

@@ -123,7 +123,8 @@ class ZGraphHttpHandler(BaseHTTPRequestHandler):
                 return
 
         try:
-            parsed = CompletionsInputLayer().handle(payload)
+            system_hint = self.runtime.build_examples_hint()
+            parsed = CompletionsInputLayer().handle(payload, system_hint=system_hint)
         except Exception as exc:
             _json_response(self, 500, {"error": str(exc)})
             return
@@ -193,14 +194,23 @@ def serve(settings: Settings) -> int:
     runtime = ZGraphRuntime(settings)
     ZGraphHttpHandler.runtime = runtime
     ZGraphHttpHandler.settings = settings
-    server = ThreadingHTTPServer((settings.host, settings.port), ZGraphHttpHandler)
-    print(f"zgraph serving on http://{settings.host}:{settings.port}")
+    # Phase 3.7：后台媒体清理循环
+    from zgraph.runtime.cleanup_loop import MediaCleanupLoop
+
+    cleanup_loop = MediaCleanupLoop(settings.media_cleanup_interval_seconds)
+    server: ThreadingHTTPServer | None = None
     try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        print("\nzgraph stopped")
+        cleanup_loop.start(runtime)
+        server = ThreadingHTTPServer((settings.host, settings.port), ZGraphHttpHandler)
+        print(f"zgraph serving on http://{settings.host}:{settings.port}")
+        try:
+            server.serve_forever()
+        except KeyboardInterrupt:
+            print("\nzgraph stopped")
     finally:
-        server.server_close()
+        cleanup_loop.stop()
+        if server is not None:
+            server.server_close()
     return 0
 
 
@@ -245,6 +255,15 @@ def run_cli(args: argparse.Namespace, settings: Settings) -> int:
     prompt = args.prompt
     if not prompt and args.text:
         prompt = " ".join(args.text)
+    # 与 HTTP handler 对齐：把 examples hint 作为系统提示拼到 prompt 前，
+    # 让 LLM 看到本地可用资源路径，从而能调 media_input。
+    examples_hint = runtime.build_examples_hint()
+    def _with_hint(user_prompt: str) -> str:
+        if not user_prompt:
+            return user_prompt
+        if examples_hint:
+            return f"system: {examples_hint}\nuser: {user_prompt}"
+        return user_prompt
     if not prompt:
         print("Enter a prompt. Press Ctrl+C to exit.")
         pending = None
@@ -272,7 +291,7 @@ def run_cli(args: argparse.Namespace, settings: Settings) -> int:
                 )
                 pending = None
             else:
-                result = runtime.run(prompt)
+                result = runtime.run(_with_hint(prompt))
 
             print(result.content)
             if result.status == "interrupted":
@@ -285,7 +304,7 @@ def run_cli(args: argparse.Namespace, settings: Settings) -> int:
                 )
         return 0
 
-    result = runtime.run(prompt)
+    result = runtime.run(_with_hint(prompt))
     _print_cli_result(result, args.json)
     if result.status == "interrupted":
         _print_resume_hint(result.run_id)

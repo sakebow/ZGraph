@@ -117,6 +117,12 @@ class LocalFSStorage:
                         count += 1
                 except FileNotFoundError:
                     continue
+            # 删完文件后，如果 run 目录变空就 rmdir 掉，避免空目录无限累积。
+            # rmdir 仅在目录为空时成功；非空会抛 OSError，吞掉即可。
+            try:
+                p.rmdir()
+            except OSError:
+                pass
         return count
 
 

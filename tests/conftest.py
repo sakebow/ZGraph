@@ -9,9 +9,12 @@ from __future__ import annotations
 
 import os
 from collections.abc import Iterator
+from pathlib import Path
 from typing import Any
 
 import pytest
+
+from zgraph.config import Settings
 
 
 # All ZGraph env-var keys that participate in provider / runtime configuration.
@@ -89,3 +92,35 @@ def clean_environ(monkeypatch: pytest.MonkeyPatch) -> dict[str, str]:
     for key in _PROVIDER_ENV_KEYS:
         monkeypatch.delenv(key, raising=False)
     return {k: os.environ.get(k, "") for k in _PROVIDER_ENV_KEYS}
+
+
+# ---------------------------------------------------------------------------
+# 共享测试 fixture：真实 PNG + 隔离 settings
+# ---------------------------------------------------------------------------
+
+
+# 真实图片：用户提供的 PNG（1.5MB+）。所有 image_bytes 必须从这里取。
+SAMPLE_IMAGE = (
+    Path(__file__).resolve().parent.parent
+    / ".zgraph"
+    / "storage"
+    / "examples"
+    / "140037382_p0.png"
+)
+
+
+@pytest.fixture
+def sample_png() -> bytes:
+    """读真实 PNG bytes。前置检查：文件存在且 > 1MB。"""
+    assert SAMPLE_IMAGE.exists(), f"missing sample image: {SAMPLE_IMAGE}"
+    data = SAMPLE_IMAGE.read_bytes()
+    assert len(data) > 1_000_000, f"expected > 1MB PNG, got {len(data)} bytes"
+    return data
+
+
+@pytest.fixture
+def tmp_settings(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Settings:
+    """构造指到 tmp_path 的 Settings（避免污染真实目录）。"""
+    monkeypatch.setenv("ZGRAPH_TMP_STORE_PATH", str(tmp_path / "storage"))
+    monkeypatch.setenv("ZGRAPH_OFFLINE", "true")
+    return Settings.from_env()

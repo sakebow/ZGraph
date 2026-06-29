@@ -3,6 +3,7 @@ from __future__ import annotations
 import fnmatch
 import json
 import locale
+import mimetypes
 import os
 import re
 import shutil
@@ -94,6 +95,17 @@ class DateTimeArgs(BaseModel):
 class TodoArgs(BaseModel):
     """todo参数。继承自 BaseModel。"""
     items: list[str]
+
+
+class MediaInputArgs(BaseModel):
+    """媒体输入参数。继承自 BaseModel。"""
+    path: str = Field(
+        description=(
+            "Absolute path, or path relative to zgraph_home (e.g. "
+            "'storage/examples/foo.png'). Use this tool whenever the user references "
+            "a media file on disk that the runtime should attach to the current run."
+        ),
+    )
 
 
 class InterruptArgs(BaseModel):
@@ -437,6 +449,80 @@ class SpawnTool(RuntimeTool):
         return ToolResult(True, f"Spawn draft created: {child_id}", draft)
 
 
+class MediaInputTool(RuntimeTool):
+    """媒体输入工具。继承自 RuntimeTool。
+
+    桥接磁盘文件 → media_store：LLM 看到用户提到本地媒体时调它，
+    bytes 走 ``context.emit_media`` 落到 ``runs/{run_id}/``，URL 经 SSE
+    流回客户端。
+    """
+
+    name = "media_input"
+    description = (
+        "Load a media file (image / audio / video / file) from disk and attach it "
+        "to the current run. Returns the URL where the uploaded file can be retrieved. "
+        "Use this whenever the user references a media file on disk."
+    )
+    risk_level = "low"
+    tags = ("media", "image", "audio", "video", "input", "attach")
+    args_schema = MediaInputArgs
+
+    def run(self, path: str) -> ToolResult:
+        """执行核心逻辑并返回结果"""
+        src = Path(path)
+        if not src.is_absolute():
+            zgraph_home = self.context.metadata.get("zgraph_home")
+            if not zgraph_home:
+                return ToolResult(
+                    False,
+                    "Relative path requires zgraph_home in ToolContext.metadata; "
+                    "please pass an absolute path instead.",
+                )
+            src = Path(str(zgraph_home)) / path
+        try:
+            resolved = src.resolve()
+        except OSError as exc:
+            return ToolResult(False, f"Cannot resolve path: {exc}")
+        if not resolved.is_file():
+            return ToolResult(False, f"File not found: {resolved}")
+
+        mime, _ = mimetypes.guess_type(str(resolved))
+        mime = mime or "application/octet-stream"
+        if mime.startswith("image/"):
+            modality = "image"
+        elif mime.startswith("audio/"):
+            modality = "audio"
+        elif mime.startswith("video/"):
+            modality = "video"
+        else:
+            modality = "file"
+
+        try:
+            data = resolved.read_bytes()
+        except OSError as exc:
+            return ToolResult(False, f"Failed to read {resolved}: {exc}")
+
+        event = self.context.emit_media(
+            modality=modality,
+            mime=mime,
+            data=data,
+            name=resolved.name,
+        )
+        return ToolResult(
+            True,
+            f"Attached {resolved.name} ({len(data)} bytes, {mime})",
+            {
+                "url": event.url,
+                "block_id": event.block_id,
+                "modality": modality,
+                "mime": mime,
+                "size_bytes": event.size_bytes,
+                "expires_at": event.expires_at,
+                "source_path": str(resolved),
+            },
+        )
+
+
 DEFAULT_TOOL_TYPES: tuple[type[RuntimeTool], ...] = (
     DateTimeTool,
     BashTool,
@@ -450,6 +536,7 @@ DEFAULT_TOOL_TYPES: tuple[type[RuntimeTool], ...] = (
     ApproveInterruptTool,
     RefuseInterruptTool,
     SpawnTool,
+    MediaInputTool,
 )
 
 

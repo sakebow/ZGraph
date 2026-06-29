@@ -48,12 +48,30 @@ class AuditHook:
             reasoning = rt.get("reasoning_content", "")
             interrupt = rt.get("interrupt")
             error = rt.get("error")
+            media = rt.get("media") or []
         else:
             status = getattr(rt, "status", "") or ""
             content = getattr(rt, "content", "") or ""
             reasoning = getattr(rt, "reasoning_content", "") or ""
             interrupt = getattr(rt, "interrupt", None)
             error = getattr(rt, "error", None)
+            media = getattr(rt, "media", None) or []
+        # Phase 3.7：把每条 media 的元数据（block_id / modality / mime / size /
+        # expires_at / url）单独记进 audit，便于事后回溯媒体生命周期。
+        media_records: list[dict[str, Any]] = []
+        for item in media:
+            if not isinstance(item, dict):
+                continue
+            media_records.append(
+                {
+                    "block_id": item.get("block_id"),
+                    "modality": item.get("modality"),
+                    "mime": item.get("mime"),
+                    "size_bytes": item.get("size_bytes"),
+                    "expires_at": item.get("expires_at"),
+                    "url": item.get("url"),
+                }
+            )
         try:
             target.parent.mkdir(parents=True, exist_ok=True)
             entry = {
@@ -64,6 +82,8 @@ class AuditHook:
                 "reasoning_len": len(reasoning or ""),
                 "interrupt": bool(interrupt),
                 "error": error,
+                "media_count": len(media_records),
+                "media": media_records,
                 "metadata_keys": list(ctx.metadata.keys()) if ctx.metadata else [],
             }
             with target.open("a", encoding="utf-8") as f:

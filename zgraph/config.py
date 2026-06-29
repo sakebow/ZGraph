@@ -222,6 +222,10 @@ class Settings:
     media_ttl_seconds: int
     """媒体文件 TTL（秒）。Phase 3.7 默认 3600（1 小时）；环境变量 ``ZGRAPH_MEDIA_TTL_SECONDS``。"""
 
+    media_cleanup_interval_seconds: int
+    """后台清理循环间隔（秒）。Phase 3.7 默认 300（5 分钟）；环境变量
+    ``ZGRAPH_MEDIA_CLEANUP_INTERVAL_SECONDS``。<= 0 禁用后台循环。"""
+
     @classmethod
     def from_env(cls) -> "Settings":
         """从当前进程环境变量构建 ``Settings`` 实例"""
@@ -320,6 +324,9 @@ class Settings:
             legacy_provider=legacy_provider,
             tmp_store_path=Path(_env("ZGRAPH_TMP_STORE_PATH", str(home / "storage"))).expanduser(),
             media_ttl_seconds=_env_int("ZGRAPH_MEDIA_TTL_SECONDS", 3600),
+            media_cleanup_interval_seconds=_env_int(
+                "ZGRAPH_MEDIA_CLEANUP_INTERVAL_SECONDS", 300
+            ),
         )
 
 

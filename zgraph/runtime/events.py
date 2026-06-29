@@ -76,6 +76,18 @@ class MediaReady(RuntimeEvent):
     metadata: dict[str, Any] = field(default_factory=dict)
     expires_at: str = ""
 
+    def to_dict(self) -> dict[str, Any]:
+        """序列化为可放进 RuntimeResult.media 的 dict。"""
+        return {
+            "block_id": self.block_id,
+            "modality": self.modality,
+            "mime": self.mime,
+            "url": self.url,
+            "size_bytes": self.size_bytes,
+            "metadata": dict(self.metadata),
+            "expires_at": self.expires_at,
+        }
+
 
 # —— 流控 ——
 

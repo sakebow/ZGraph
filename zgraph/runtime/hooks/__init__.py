@@ -32,6 +32,9 @@ class RunContext:
         metadata: 跨 hook 共享的临时存储（dict[str, Any]）。下游 hook 可读
             上游 hook 写入的键值对；典型用途：MetricsHook 累计 token 数，
             AuditHook 把它写进 audit.json。
+        state: Phase 5.1 — runtime 内部的 intent/capability/guardian 状态字典。
+            AuditHook 在 Final 事件触发时把它完整写进 audit.json 的 NDJSON 记录，
+            便于 ``resume_interrupted`` 后续读取。无状态时为 None。
     """
 
     run_id: str
@@ -39,6 +42,7 @@ class RunContext:
     settings: Settings
     started_at: float
     metadata: dict[str, Any] = field(default_factory=dict)
+    state: dict[str, Any] | None = None
 
 
 @runtime_checkable

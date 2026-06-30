@@ -60,6 +60,12 @@ def _isolate_provider_env(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     """
     for key in _PROVIDER_ENV_KEYS:
         monkeypatch.delenv(key, raising=False)
+    # 同时清理 workspace 相关 env：防止别的测试用 ``os.environ[...] = ...``
+    # 直接改全局环境而泄漏到下一个测试。monkeypatch 在测试结束时只会还原它
+    # 自己的修改；如果测试直接改 os.environ，monkeypatch 不能撤销，所以这里
+    # 主动删一次，保证后续测试拿到的 zgraph_home / tmp_store_path 是干净的。
+    monkeypatch.delenv("ZGRAPH_HOME", raising=False)
+    monkeypatch.delenv("ZGRAPH_TMP_STORE_PATH", raising=False)
     yield
 
 

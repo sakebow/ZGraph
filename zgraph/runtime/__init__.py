@@ -30,7 +30,6 @@ from zgraph.core.skills.loader import SkillLoader
 from zgraph.core.tool.base import ToolContext, RuntimeTool
 from zgraph.core.tool.builder import build_default_tool_registry
 from zgraph.middleware.base import MiddlewareChain
-from zgraph.middleware.exceptions import ExceptionMiddleware
 from zgraph.middleware.limit import RateLimitMiddleware
 from zgraph.middleware.logger import LoggerMiddleware
 from zgraph.workflow.guardian.approve import ApproveWorkflow
@@ -46,6 +45,69 @@ from zgraph.workflow.service.intent import IntentWorkflow
 from zgraph.workflow.service.recommend import RecommendQuestionsWorkflow
 from zgraph.workflow.spec import validate_workflow_spec
 from zgraph.workspace import WorkspaceManager, RunWorkspace
+
+
+def _read_interrupted_state(audit_path) -> tuple[dict[str, Any], dict[str, Any]]:
+    """读 audit.json，提取中断状态。
+
+    Phase 5.1 兼容两种格式：
+    - 新格式（AuditHook NDJSON）：每行一条记录，可能带 ``state`` /
+      ``interrupt_payload`` 字段（``interrupt_payload`` 是 Phase 5.1 新加的）。
+    - 老格式（``_write_audit`` 单 JSON 对象）：顶层 ``state`` / ``interrupt`` 字段。
+
+    区分规则（按 schema 而非文本布局）：
+    - 整段 ``json.loads`` 成功后，看顶层 ``interrupt`` 字段。
+    - 如果 ``interrupt`` 是 dict → 老格式（``_write_audit`` 写的）。
+    - 如果 ``interrupt`` 是 bool 或缺省 → NDJSON（AuditHook 写的），按行解析取最后一条。
+
+    返回:
+        (state, interrupt) 元组。
+    """
+    text = audit_path.read_text(encoding="utf-8")
+    if not text.strip():
+        return {}, {}
+
+    # 1. 尝试整段解析（老格式）
+    try:
+        audit = json.loads(text)
+        if isinstance(audit, dict) and isinstance(audit.get("interrupt"), dict):
+            # 老格式：顶层 interrupt 是 dict
+            return (
+                dict(audit.get("state") or {}),
+                dict(audit.get("interrupt") or {}),
+            )
+    except json.JSONDecodeError:
+        pass
+
+    # 2. NDJSON 路径（AuditHook 写的）
+    last_entry: dict[str, Any] | None = None
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(obj, dict):
+            last_entry = obj
+
+    if last_entry is not None:
+        state: dict[str, Any] = dict(last_entry.get("state") or {})
+        interrupt_payload = last_entry.get("interrupt_payload")
+        interrupt: dict[str, Any] = (
+            dict(interrupt_payload) if isinstance(interrupt_payload, dict) else {}
+        )
+        return state, interrupt
+
+    # 3. 单 dict 但 interrupt 不是 dict —— 用 interrupt 本身作为兜底
+    if isinstance(audit, dict):
+        return (
+            dict(audit.get("state") or {}),
+            {},
+        )
+
+    return {}, {}
 
 
 @dataclass(slots=True)
@@ -223,105 +285,87 @@ class ZGraphRuntime:
         async def _gen():
             """内部 generator，把所有 yield 集中在一处。
 
-            用 try/finally 兜底：所有路径（成功 / 失败 / interrupted / 异常）
+            用 try/except/finally 兜底：所有路径（成功 / 失败 / interrupted / 异常）
             都会把 ``_pending_media[workspace.run_id]`` 弹掉，避免内存泄漏。
             失败路径在 yield _failed_final 前先把累积的 media events 一起 yield
             出去（通过 ``_with_pending_media`` 附加到 Final.runtime_result.media）。
+
+            Phase 5.4：outer ``except Exception`` 把 Guardian / offline / dispatch 路径
+            的异常转译成 ``status='failed'`` 的 Final 事件。docstring 673-674 的承诺
+            现在对所有路径成立，不再需要 ExceptionMiddleware 兜底。
             """
             try:
-                # —— 1. sync pre-flight：setup / intent / capability ——
+                # —— 1. sync pre-flight：setup / intent / capability / guardian ——
                 try:
-                    context = ToolContext(
-                        workspace=workspace,
-                        allow_bash=self.settings.allow_bash,
-                        emit_media=self._make_emit_media(workspace.run_id),
-                        metadata={"zgraph_home": str(self.settings.zgraph_home)},
-                    )
-                    tool_registry = build_default_tool_registry(context)
-                    skills = SkillLoader(self._skill_dirs()).load()
-                    state: dict[str, Any] = {
-                        "run_id": workspace.run_id,
-                        "user_input": user_input,
-                        "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                    }
-                    intent_result = self.intent_workflow.run(state)
-                    state.update(intent_result.data)
-                    compiler = CapabilityCompiler(self.settings, tool_registry, skills)
-                    capabilities = compiler.compile(state)
-                    state["capabilities"] = capabilities
+                    setup = self._setup_runtime(user_input, workspace, ctx)
                 except Exception as exc:
                     yield self._with_pending_media(
                         self._failed_final(workspace.run_id, f"setup failed: {exc}"),
                         workspace.run_id,
                     )
                     return
+                if setup is None:
+                    return
+                state, capabilities, interrupt, tool_registry, skills, context = setup
 
-                # —— 2. Guardian（同步；interrupted 路径 emit Final 而非走 stream）——
-                interrupt: dict[str, Any] | None = None
-                if capabilities.get("risk_level") in {"medium", "high"}:
-                    validation = self.validate_workflow.run(state)
-                    if validation.status != "completed":
-                        yield self._with_pending_media(
-                            self._failed_final(
-                                workspace.run_id,
-                                "; ".join(validation.errors) or "Guardian validation failed",
-                                state=state,
+                # Phase 5.6：Guardian 自动批准后，把 context.allow_bash 翻成 True。
+                # 旧 ``_run_unprotected`` 在 auto-approve 后做过这件事；astream 之前
+                # 漏了这一步，导致 auto-approved high-risk task 调 bash tool 时
+                # 会被拒绝。BashTool 读取的是 ToolContext.allow_bash 而不是 settings。
+                if state.get("auto_approved") and context is not None:
+                    context.allow_bash = True
+
+                # —— 2. 已经被 Guardian 阻断（手动审批 pending） ——
+                if interrupt is not None and interrupt.get("status") == "pending":
+                    yield self._with_pending_media(
+                        Final(
+                            run_id=workspace.run_id,
+                            status="interrupted",
+                            finish_reason="interrupted",
+                            runtime_result=RuntimeResult(
+                                run_id=workspace.run_id,
+                                status="interrupted",
+                                content="High risk task requires explicit approval.",
+                                hint=state.get("hint", {}),
+                                intent=state.get("intent", {}),
+                                todo=state.get("todo", []),
                                 capabilities=capabilities,
+                                interrupt=interrupt,
+                                interrupt_token=interrupt.get("interrupt_id", ""),
                             ),
-                            workspace.run_id,
-                        )
-                        return
-                    risk = self.risk_workflow.run(state)
-                    capabilities["risk_level"] = risk.data["risk_level"]
-                    state["risk_level"] = capabilities["risk_level"]
-                    approval = self.approve_workflow.run(state)
-                    if approval.status == "interrupted":
-                        interrupt = approval.data["interrupt"]
-                        if not self.settings.auto_approve_interrupts:
-                            yield self._with_pending_media(
-                                Final(
-                                    run_id=workspace.run_id,
-                                    status="interrupted",
-                                    finish_reason="interrupted",
-                                    runtime_result=RuntimeResult(
-                                        run_id=workspace.run_id,
-                                        status="interrupted",
-                                        content="High risk task requires explicit approval.",
-                                        hint=state.get("hint", {}),
-                                        intent=state.get("intent", {}),
-                                        todo=state.get("todo", []),
-                                        capabilities=capabilities,
-                                        interrupt=interrupt,
-                                        interrupt_token=interrupt.get("interrupt_id", ""),
-                                    ),
-                                ),
-                                workspace.run_id,
-                            )
-                            return
-                        interrupt["status"] = "approved"
-                        interrupt["decision_reason"] = "auto-approved by runtime policy"
-                        state["interrupt"] = interrupt
+                        ),
+                        workspace.run_id,
+                    )
+                    return
 
                 selected_tools = self._selected_tools(capabilities, tool_registry)
 
                 # —— 3. offline / 无 api_key：直接 Final ——
                 if self.settings.offline or not self.settings.api_key:
                     offline_text = self._offline_execute(user_input, workspace, state)
+                    offline_artifacts = self._compute_artifacts(workspace)
+                    offline_rt = RuntimeResult(
+                        run_id=workspace.run_id,
+                        status="completed",
+                        content=str(offline_text),
+                        hint=state.get("hint", {}),
+                        intent=state.get("intent", {}),
+                        todo=state.get("todo", []),
+                        capabilities=capabilities,
+                        interrupt=interrupt,
+                        artifacts=offline_artifacts,
+                        media=[m.to_dict() for m in self._consume_media(workspace.run_id)],
+                    )
+                    self._save_memory(user_input, offline_rt)
+                    # audit.json 由 AuditHook 在 Final 事件上写 NDJSON（不要在这里
+                    # 调 _write_audit，否则会和 AuditHook 写同一文件产生冲突）。
+                    self.workspace_manager.cleanup_expired(self.settings.run_ttl_seconds)
                     yield self._with_pending_media(
                         Final(
                             run_id=workspace.run_id,
                             status="completed",
                             finish_reason="stop",
-                            runtime_result=RuntimeResult(
-                                run_id=workspace.run_id,
-                                status="completed",
-                                content=str(offline_text),
-                                hint=state.get("hint", {}),
-                                intent=state.get("intent", {}),
-                                todo=state.get("todo", []),
-                                capabilities=capabilities,
-                                interrupt=interrupt,
-                            ),
+                            runtime_result=offline_rt,
                         ),
                         workspace.run_id,
                     )
@@ -415,9 +459,55 @@ class ZGraphRuntime:
                         todo=state.get("todo", []),
                         capabilities=capabilities,
                         interrupt=interrupt,
+                        artifacts=self._compute_artifacts(workspace),
                         reasoning_content=full_reasoning,
                         media=[m.to_dict() for m in media_events],
                     ),
+                )
+                # Phase 5.5：streaming 完成路径补 _save_memory / cleanup_expired。
+                # 之前只有 offline 分支调了，线上 LLM 流式完成路径完全跳过
+                # 记忆压缩和过期 cleanup，导致 memory_saver / media TTL 行为不一致。
+                # _write_audit 由 AuditHook 在 Final 事件上写 NDJSON 替代。
+                try:
+                    loop = asyncio.get_running_loop()
+                    await loop.run_in_executor(
+                        None,
+                        lambda: self._save_memory(
+                            user_input,
+                            RuntimeResult(
+                                run_id=workspace.run_id,
+                                status="completed",
+                                content=full_content,
+                                reasoning_content=full_reasoning,
+                            ),
+                        ),
+                    )
+                except Exception as exc:
+                    self.logger.warning(
+                        "_save_memory failed run_id=%s: %s", workspace.run_id, exc
+                    )
+                try:
+                    loop = asyncio.get_running_loop()
+                    await loop.run_in_executor(
+                        None,
+                        lambda: self.workspace_manager.cleanup_expired(
+                            self.settings.run_ttl_seconds
+                        ),
+                    )
+                except Exception as exc:
+                    self.logger.warning(
+                        "cleanup_expired failed run_id=%s: %s", workspace.run_id, exc
+                    )
+            except Exception as exc:
+                # Phase 5.4：兜底任何裸奔的异常（Guardian/offline/conversation persist
+                # 之外的路径上抛错）。把异常转译成 status='failed' Final 事件，保持
+                # ``astream()`` 始终以 Final 收尾的契约。
+                self.logger.warning(
+                    "astream unexpected error run_id=%s: %s", workspace.run_id, exc
+                )
+                yield self._with_pending_media(
+                    self._failed_final(workspace.run_id, f"astream failed: {exc}"),
+                    workspace.run_id,
                 )
             finally:
                 # Defensive: 即便上面某个 yield 抛异常（罕见，比如 hook 抛错冒上来），
@@ -429,6 +519,80 @@ class ZGraphRuntime:
             processed = await self._apply_hooks(event, ctx)
             if processed is not None:
                 yield processed
+
+    def _setup_runtime(
+        self,
+        user_input: str,
+        workspace: RunWorkspace,
+        ctx: "Any",
+    ) -> "tuple[dict[str, Any], dict[str, Any], dict[str, Any] | None, Any, list[Any], ToolContext] | None":
+        """Phase 5.2：共享的 setup（intent + capability + guardian）。
+
+        astream() 和 _run_unprotected() 都调它。返回 (state, capabilities,
+        interrupt, tool_registry, skills, context) 元组；如果 setup 任何阶段失败，
+        astream 需要知道（yield failed_final），所以这个 helper 不抛异常 —— 出错时
+        由调用方捕获。
+
+        中断语义：
+        - ``interrupt`` 为 ``None``：正常路径。
+        - ``interrupt["status"] == "pending"``：需要人工审批，调用方应 yield
+          Final(status="interrupted") 并返回。
+        - ``interrupt["status"] == "approved"``：Guardian 自动批准，可继续执行。
+
+        返回:
+            元组 (state, capabilities, interrupt, tool_registry, skills, context)，
+            或 None（如果 setup 内部抛异常，调用方需要捕获并生成 failed_final）。
+        """
+        from zgraph.runtime.hooks import RunContext
+
+        context = ToolContext(
+            workspace=workspace,
+            allow_bash=self.settings.allow_bash,
+            emit_media=self._make_emit_media(workspace.run_id),
+            metadata={"zgraph_home": str(self.settings.zgraph_home)},
+        )
+        tool_registry = build_default_tool_registry(context)
+        skills = SkillLoader(self._skill_dirs()).load()
+        state: dict[str, Any] = {
+            "run_id": workspace.run_id,
+            "user_input": user_input,
+            "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }
+        # Phase 5.1：把 state 暴露给 hook（AuditHook 在 Final 事件触发时
+        # 把它写进 NDJSON，便于 resume_interrupted 恢复）。
+        if isinstance(ctx, RunContext):
+            ctx.state = state
+        intent_result = self.intent_workflow.run(state)
+        state.update(intent_result.data)
+        compiler = CapabilityCompiler(self.settings, tool_registry, skills)
+        capabilities = compiler.compile(state)
+        state["capabilities"] = capabilities
+
+        interrupt: dict[str, Any] | None = None
+        if capabilities.get("risk_level") in {"medium", "high"}:
+            validation = self.validate_workflow.run(state)
+            if validation.status != "completed":
+                raise RuntimeError(
+                    "; ".join(validation.errors) or "Guardian validation failed"
+                )
+            risk = self.risk_workflow.run(state)
+            capabilities["risk_level"] = risk.data["risk_level"]
+            state["risk_level"] = capabilities["risk_level"]
+            approval = self.approve_workflow.run(state)
+            if approval.status == "interrupted":
+                interrupt = approval.data["interrupt"]
+                if not self.settings.auto_approve_interrupts:
+                    # 让调用方识别 pending 中断并 yield Final(status="interrupted")
+                    return state, capabilities, interrupt, tool_registry, skills, context
+                interrupt["status"] = "approved"
+                interrupt["decision_reason"] = "auto-approved by runtime policy"
+                state["interrupt"] = interrupt
+                # Phase 5.6：标记 auto-approved，下游 astream / _run_workflow_path 会
+                # 翻 ``context.allow_bash = True``，让 bash 等高风险 tool 在自动批准
+                # 路径下能正常执行（旧 _run_unprotected 行为恢复）。
+                state["auto_approved"] = True
+
+        return state, capabilities, interrupt, tool_registry, skills, context
 
     def _failed_final(
         self,
@@ -656,160 +820,140 @@ class ZGraphRuntime:
         return StreamAggregator.collect(events)
 
     def run(self, user_input: str, *, run_id: str | None = None) -> RuntimeResult:
+        """同步入口：dispatch 后走对应的执行路径。
+
+        Phase 5.2 修复（review #2/#3）：
+        - 之前 ``run()`` 改走 ``astream()`` 后，砍掉了 deterministic workflow 执行
+          路径和 recommend intent 短路。exam-plan 这类 workflow skill 走 ``run()``
+          会得到 LLM chat 而不是 workflow 执行。
+        - 现在 ``run()`` 先做 intent/capability（复用 ``_setup_runtime`` helper），
+          根据 dispatch 决定走：
+          - ``recommend_questions`` → ``_run_recommendation``
+          - 选了 ``temporary_workflow`` → ``_execute``（workflow / configured /
+            temporary 路径）
+          - 否则 → ``run_via_stream()`` → ``astream()``（带 hooks 的流式）
+
+        速率限制 + 日志中间件仍保留（RateLimit / Logger）；异常中间件移除
+        —— ``astream()`` 内部已经把所有异常转译成 ``status='failed'`` 的
+        Final 事件，``StreamAggregator.collect`` 会原样返回。
+        """
         workspace = self.workspace_manager.create_run(run_id)
         request = {"user_input": user_input, "run_id": workspace.run_id}
 
+        # Hook chain endpoint：根据 dispatch 结果返回 RuntimeResult.to_dict()
+        def _endpoint(payload: dict[str, Any]) -> dict[str, Any]:
+            prompt = str(payload.get("user_input", ""))
+            return self._dispatch_and_run(prompt, workspace).to_dict()
+
         chain = MiddlewareChain(
             [
-                ExceptionMiddleware(debug=False),
                 RateLimitMiddleware(max_calls=120, period_seconds=60),
                 LoggerMiddleware(self.logger),
             ],
-            lambda payload: self._run_unprotected(payload, workspace),
+            _endpoint,
         )
         response = chain(request)
-        if response.get("status") == "failed" and "content" not in response:
+        return RuntimeResult(**response)
+
+    def _dispatch_and_run(
+        self, user_input: str, workspace: RunWorkspace
+    ) -> RuntimeResult:
+        """Phase 5.2：根据 intent + capability 决定走哪条执行路径。
+
+        dispatch 表：
+        - ``recommend_questions`` → ``_run_recommendation``
+        - ``selected_workflows`` 包含 ``"temporary_workflow"`` → ``_execute``
+          （会自动判断走 ``_execute_temporary_workflow`` 或
+          ``_execute_configured_workflow``）
+        - 否则 → ``run_via_stream()``（带 hooks 的流式 LLM）
+
+        异常处理：setup 失败直接构造 status=failed 的 RuntimeResult 返回。
+        """
+        # Phase 5.2：用 _setup_runtime 共享 intent/capability/guardian。
+        # setup 需要一个 RunContext（哪怕只是为了让 AuditHook 写 state）；
+        # 在这里构造一个 ephemeral ctx，setup 完后丢弃。
+        from zgraph.runtime.hooks import RunContext
+
+        ctx = RunContext(
+            run_id=workspace.run_id,
+            user_input=user_input,
+            settings=self.settings,
+            started_at=time.time(),
+        )
+        try:
+            setup = self._setup_runtime(user_input, workspace, ctx)
+        except Exception as exc:
+            self.logger.warning("dispatch setup failed: %s", exc)
             return RuntimeResult(
                 run_id=workspace.run_id,
                 status="failed",
                 content="",
-                error=response.get("error"),
+                error=f"setup failed: {exc}",
             )
-        return RuntimeResult(**response)
+        if setup is None:
+            return RuntimeResult(
+                run_id=workspace.run_id,
+                status="failed",
+                content="",
+                error="setup returned no result",
+            )
+        state, capabilities, interrupt, tool_registry, skills, context = setup
 
-    def _run_unprotected(self, request: dict[str, Any], workspace: RunWorkspace) -> dict[str, Any]:
-        user_input = str(request.get("user_input", ""))
-        self.logger.info("run_id=%s stage=setup:start", workspace.run_id)
-        context = ToolContext(
-            workspace=workspace,
-            allow_bash=self.settings.allow_bash,
-            emit_media=self._make_emit_media(workspace.run_id),
-            metadata={"zgraph_home": str(self.settings.zgraph_home)},
-        )
-        tool_registry = build_default_tool_registry(context)
-        skill_started = time.perf_counter()
-        skills = SkillLoader(self._skill_dirs()).load()
-        self.logger.info(
-            "run_id=%s stage=skills:end elapsed_ms=%.2f count=%s",
-            workspace.run_id,
-            (time.perf_counter() - skill_started) * 1000,
-            len(skills),
-        )
+        # Guardian 中断（需要人工审批）：返回 RuntimeResult(status="interrupted")
+        if interrupt is not None and interrupt.get("status") == "pending":
+            return RuntimeResult(
+                run_id=workspace.run_id,
+                status="interrupted",
+                content="High risk task requires explicit approval.",
+                hint=state.get("hint", {}),
+                intent=state.get("intent", {}),
+                todo=state.get("todo", []),
+                capabilities=capabilities,
+                interrupt=interrupt,
+                interrupt_token=interrupt.get("interrupt_id", ""),
+            )
 
-        state: dict[str, Any] = {
-            "run_id": workspace.run_id,
-            "user_input": user_input,
-            "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        }
-        intent_started = time.perf_counter()
-        self.logger.info("run_id=%s stage=intent:start", workspace.run_id)
-        intent_result = self.intent_workflow.run(state)
-        state.update(intent_result.data)
-        self.logger.info(
-            "run_id=%s stage=intent:end elapsed_ms=%.2f intent=%s source=%s",
-            workspace.run_id,
-            (time.perf_counter() - intent_started) * 1000,
-            (state.get("intent") or {}).get("name"),
-            (state.get("hint") or {}).get("source"),
-        )
-
-        capability_started = time.perf_counter()
-        self.logger.info("run_id=%s stage=capability:start", workspace.run_id)
-        compiler = CapabilityCompiler(self.settings, tool_registry, skills)
-        capabilities = compiler.compile(state)
-        state["capabilities"] = capabilities
-        self.logger.info(
-            "run_id=%s stage=capability:end elapsed_ms=%.2f skills=%s tools=%s risk=%s strategy=%s",
-            workspace.run_id,
-            (time.perf_counter() - capability_started) * 1000,
-            capabilities.get("selected_skills"),
-            capabilities.get("selected_tools"),
-            capabilities.get("risk_level"),
-            capabilities.get("retrieval_strategy"),
-        )
-
+        # Dispatch 1: recommend_questions intent
         if self._is_recommendation_request(state):
-            self.logger.info("run_id=%s stage=recommendation:start", workspace.run_id)
-            return self._run_recommendation(workspace, state).to_dict()
+            return self._run_recommendation(workspace, state)
 
-        interrupt: dict[str, Any] | None = None
-        if capabilities["risk_level"] in {"medium", "high"}:
-            guardian_started = time.perf_counter()
-            self.logger.info("run_id=%s stage=guardian:start risk=%s", workspace.run_id, capabilities["risk_level"])
-            validation = self.validate_workflow.run(state)
-            if validation.status != "completed":
-                return RuntimeResult(
-                    run_id=workspace.run_id,
-                    status="failed",
-                    content="Guardian validation failed",
-                    hint=state.get("hint", {}),
-                    intent=state.get("intent", {}),
-                    todo=state.get("todo", []),
-                    capabilities=capabilities,
-                    error="; ".join(validation.errors),
-                ).to_dict()
-            risk = self.risk_workflow.run(state)
-            capabilities["risk_level"] = risk.data["risk_level"]
-            state["risk_level"] = capabilities["risk_level"]
-            approval = self.approve_workflow.run(state)
-            if approval.status == "interrupted":
-                interrupt = approval.data["interrupt"]
-                context.interrupts[interrupt["interrupt_id"]] = interrupt
-                if not self.settings.auto_approve_interrupts:
-                    self._write_audit(workspace, state, interrupt=interrupt)
-                    return RuntimeResult(
-                        run_id=workspace.run_id,
-                        status="interrupted",
-                        content="High risk task requires explicit approval.",
-                        hint=state.get("hint", {}),
-                        intent=state.get("intent", {}),
-                        todo=state.get("todo", []),
-                        capabilities=capabilities,
-                        interrupt=interrupt,
-                    ).to_dict()
-
-                interrupt["status"] = "approved"
-                interrupt["decision_reason"] = "auto-approved by runtime policy"
-                state["interrupt"] = interrupt
-                state["auto_approved"] = True
-                context.allow_bash = True
-            self.logger.info(
-                "run_id=%s stage=guardian:end elapsed_ms=%.2f risk=%s interrupt_status=%s",
-                workspace.run_id,
-                (time.perf_counter() - guardian_started) * 1000,
-                capabilities.get("risk_level"),
-                (interrupt or {}).get("status"),
+        # Dispatch 2: temporary_workflow capability（configured / temporary 都走 _execute）
+        if "temporary_workflow" in (capabilities.get("selected_workflows") or []):
+            return self._run_workflow_path(
+                user_input, workspace, capabilities, state, skills, tool_registry, context
             )
 
+        # 默认：astream 流式 LLM（带 hooks）
+        return self.run_via_stream(user_input, run_id=workspace.run_id)
+
+    def _run_workflow_path(
+        self,
+        user_input: str,
+        workspace: RunWorkspace,
+        capabilities: dict[str, Any],
+        state: dict[str, Any],
+        skills: list[Any],
+        tool_registry: Any,
+        context: ToolContext,
+    ) -> RuntimeResult:
+        """Phase 5.2：workflow 执行路径（temporary / configured）。
+
+        复用 ``_execute`` → ``_execute_temporary_workflow`` / ``_execute_configured_workflow``。
+        注意：因为这是 run() 的 sync 入口，我们不消费事件流，但会构造完整
+        RuntimeResult（包含 state['_execution_data']、state['_execution_error']）。
+        """
+        # 注入 context.allow_bash：如果 Guardian 自动批准，allow_bash 必须翻成 True
+        if state.get("auto_approved"):
+            context.allow_bash = True
         selected_tools = self._selected_tools(capabilities, tool_registry)
-        execute_started = time.perf_counter()
-        self.logger.info(
-            "run_id=%s stage=execute:start tools=%s offline=%s",
-            workspace.run_id,
-            [tool.name for tool in selected_tools],
-            self.settings.offline,
-        )
         content = self._execute(user_input, workspace, selected_tools, state, skills, tool_registry)
         if isinstance(content, AgentResult):
-            agent_result = content
-            content_text = agent_result.content
-            reasoning_text = agent_result.reasoning_content
+            content_text = content.content
+            reasoning_text = content.reasoning_content
         else:
-            agent_result = None
-            content_text = content
+            content_text = str(content)
             reasoning_text = ""
-        self.logger.info(
-            "run_id=%s stage=execute:end elapsed_ms=%.2f chars=%s reasoning_chars=%s",
-            workspace.run_id,
-            (time.perf_counter() - execute_started) * 1000,
-            len(content_text),
-            len(reasoning_text),
-        )
-        artifacts = [str(path) for path in workspace.artifacts_dir.glob("*") if path.is_file()]
-        # Phase 3.4 收尾：不再读 ``outputs_dir``（已是 ``storage_dir`` 别名），直接
-        # 走 storage_dir。这样以后把别名砍掉也不会破。
-        artifacts.extend(str(path) for path in workspace.storage_dir.glob("*") if path.is_file())
-
+        artifacts = self._compute_artifacts(workspace)
         result = RuntimeResult(
             run_id=workspace.run_id,
             status=str(state.get("_execution_status", "completed")),
@@ -818,7 +962,7 @@ class ZGraphRuntime:
             intent=state.get("intent", {}),
             todo=state.get("todo", []),
             capabilities=capabilities,
-            interrupt=interrupt,
+            interrupt=state.get("interrupt"),
             artifacts=artifacts,
             error=state.get("_execution_error"),
             data=state.get("_execution_data"),
@@ -826,11 +970,26 @@ class ZGraphRuntime:
             media=[m.to_dict() for m in self._consume_media(workspace.run_id)],
         )
         self._save_memory(user_input, result)
-        self.logger.info("run_id=%s stage=audit:start", workspace.run_id)
+        # workflow 路径不写 audit.json NDJSON —— 用老格式 _write_audit，
+        # 因为它存完整 state，便于后续手动恢复。
         self._write_audit(workspace, state, result=result.to_dict())
-        self.logger.info("run_id=%s stage=audit:end", workspace.run_id)
         self.workspace_manager.cleanup_expired(self.settings.run_ttl_seconds)
-        return result.to_dict()
+        return result
+
+    @staticmethod
+    def _compute_artifacts(workspace: RunWorkspace) -> list[str]:
+        """列出本次 run 的所有产物文件（artifacts_dir + storage_dir）。
+
+        Phase 3.4 收尾：不再读 ``outputs_dir``（已是 ``storage_dir`` 别名），直接
+        走 storage_dir。这样以后把别名砍掉也不会破。
+        """
+        artifacts = [
+            str(path) for path in workspace.artifacts_dir.glob("*") if path.is_file()
+        ]
+        artifacts.extend(
+            str(path) for path in workspace.storage_dir.glob("*") if path.is_file()
+        )
+        return artifacts
 
     def recommend_questions(self, *, run_id: str | None = None) -> RuntimeResult:
         """推荐问题"""
@@ -947,9 +1106,11 @@ class ZGraphRuntime:
                 error="audit log not found",
             )
 
-        audit = json.loads(audit_path.read_text(encoding="utf-8"))
-        state = audit.get("state") or {}
-        interrupt = audit.get("interrupt") or {}
+        # Phase 5.1：兼容两种 audit.json 格式：
+        # - 新格式：AuditHook 写的 NDJSON，每行一条记录，最后一行带 interrupt_payload。
+        # - 老格式：``_write_audit`` 写的单 JSON 对象，state/result/interrupt 是顶层字段。
+        # 优先读新格式（最后一条记录）；找不到对应字段再回退到老格式。
+        state, interrupt = _read_interrupted_state(audit_path)
         if not interrupt or interrupt.get("status") != "pending":
             return RuntimeResult(
                 run_id=run_id,

@@ -172,6 +172,146 @@ class TestAuditHook:
         assert out.text == "hello"
         assert not audit_file.exists()
 
+    async def test_writes_interrupt_payload_on_interrupted_final(self, tmp_path: Path):
+        """Phase 5.1：Final 携带 interrupt dict 时，AuditHook 写 interrupt_payload
+        完整 dict（不仅 bool）。``resume_interrupted`` 后续读这个字段恢复中断。
+        """
+        audit_file = tmp_path / "audit.json"
+        ctx = RunContext(run_id="r1", user_input="hi", settings=_settings(), started_at=0.0)
+        hook = AuditHook(path=audit_file)
+        rt_dict = {
+            "run_id": "r1",
+            "status": "interrupted",
+            "content": "blocked",
+            "interrupt": {
+                "interrupt_id": "i-1",
+                "status": "pending",
+                "reason": "high risk tool",
+            },
+        }
+        await hook(
+            Final(
+                run_id="r1",
+                status="interrupted",
+                finish_reason="interrupt",
+                runtime_result=rt_dict,
+            ),
+            ctx,
+        )
+        lines = [l for l in audit_file.read_text(encoding="utf-8").splitlines() if l.strip()]
+        assert len(lines) == 1
+        entry = json.loads(lines[0])
+        # bool 字段仍然存在（向后兼容）
+        assert entry["interrupt"] is True
+        # 完整 payload 也写进去
+        assert entry["interrupt_payload"] == {
+            "interrupt_id": "i-1",
+            "status": "pending",
+            "reason": "high risk tool",
+        }
+
+    async def test_writes_state_when_ctx_state_set(self, tmp_path: Path):
+        """Phase 5.1：ctx.state 非 None 时，AuditHook 把它写进 entry.state。
+        这是 ``resume_interrupted`` 恢复中断 run 所需的状态来源。
+        """
+        audit_file = tmp_path / "audit.json"
+        state_dict = {
+            "run_id": "r1",
+            "user_input": "what is 2+2",
+            "hint": {"summary": "math"},
+            "intent": {"name": "chat"},
+            "capabilities": {"risk_level": "high", "selected_tools": ["bash"]},
+        }
+        ctx = RunContext(
+            run_id="r1",
+            user_input="what is 2+2",
+            settings=_settings(),
+            started_at=0.0,
+            state=state_dict,
+        )
+        hook = AuditHook(path=audit_file)
+        rt = {
+            "run_id": "r1",
+            "status": "interrupted",
+            "interrupt": {"interrupt_id": "i-1", "status": "pending"},
+        }
+        await hook(
+            Final(run_id="r1", status="interrupted", finish_reason="interrupt", runtime_result=rt),
+            ctx,
+        )
+        lines = [l for l in audit_file.read_text(encoding="utf-8").splitlines() if l.strip()]
+        entry = json.loads(lines[0])
+        assert entry["state"] == state_dict
+        assert entry["state"]["user_input"] == "what is 2+2"
+        assert entry["state"]["capabilities"]["risk_level"] == "high"
+
+    async def test_no_state_field_when_ctx_state_is_none(self, tmp_path: Path):
+        """ctx.state 为 None 时不写 state 字段（向后兼容老 entry 形态）。"""
+        audit_file = tmp_path / "audit.json"
+        ctx = RunContext(
+            run_id="r1",
+            user_input="hi",
+            settings=_settings(),
+            started_at=0.0,
+            state=None,
+        )
+        hook = AuditHook(path=audit_file)
+        rt = {"run_id": "r1", "status": "completed"}
+        await hook(Final(run_id="r1", status="completed", finish_reason="stop", runtime_result=rt), ctx)
+        lines = [l for l in audit_file.read_text(encoding="utf-8").splitlines() if l.strip()]
+        entry = json.loads(lines[0])
+        assert "state" not in entry
+
+    async def test_writes_metrics_from_ctx_metadata(self, tmp_path: Path):
+        """Phase 5.8：AuditHook 把 ``ctx.metadata['metrics']`` 字典写进 audit.json
+        entry.metrics。MetricsHook 写入的值不再被默默丢掉。
+        """
+        audit_file = tmp_path / "audit.json"
+        ctx = RunContext(
+            run_id="r1",
+            user_input="hi",
+            settings=_settings(),
+            started_at=0.0,
+            state=None,
+        )
+        # 模拟 MetricsHook 已经写过 metrics 字典
+        ctx.metadata["metrics"] = {
+            "content_delta_count": 3,
+            "content_chars": 42,
+            "reasoning_delta_count": 1,
+            "reasoning_chars": 10,
+            "tool_call_count": 0,
+            "interrupt_count": 0,
+            "media_count": 1,
+        }
+        hook = AuditHook(path=audit_file)
+        rt = {"run_id": "r1", "status": "completed"}
+        await hook(Final(run_id="r1", status="completed", finish_reason="stop", runtime_result=rt), ctx)
+        lines = [l for l in audit_file.read_text(encoding="utf-8").splitlines() if l.strip()]
+        entry = json.loads(lines[0])
+        assert "metrics" in entry
+        assert entry["metrics"]["content_delta_count"] == 3
+        assert entry["metrics"]["content_chars"] == 42
+        assert entry["metrics"]["media_count"] == 1
+
+    async def test_no_metrics_field_when_metadata_has_no_metrics(self, tmp_path: Path):
+        """ctx.metadata 没有 'metrics' key 时不写 metrics 字段（向后兼容）。"""
+        audit_file = tmp_path / "audit.json"
+        ctx = RunContext(
+            run_id="r1",
+            user_input="hi",
+            settings=_settings(),
+            started_at=0.0,
+            state=None,
+        )
+        # metadata 是空 dict（没有 metrics 键）
+        hook = AuditHook(path=audit_file)
+        rt = {"run_id": "r1", "status": "completed"}
+        await hook(Final(run_id="r1", status="completed", finish_reason="stop", runtime_result=rt), ctx)
+        lines = [l for l in audit_file.read_text(encoding="utf-8").splitlines() if l.strip()]
+        entry = json.loads(lines[0])
+        assert "metrics" not in entry
+
 
 # ---------------------------------------------------------------------------
 # 链式行为：drop / 异常隔离 / metadata 传递
@@ -296,3 +436,46 @@ class TestRuntimeHookIntegration:
         rt = ZGraphRuntime(_settings(), hooks=[Noop()])
         assert len(rt.hooks) == 1
         assert isinstance(rt.hooks[0], Noop)
+
+
+class TestRunFiresHooks:
+    """架构意图：``runtime.run()`` 同步入口也必须经过 hooks 链。
+
+    之前 ``run()`` 走 ``_run_unprotected``，完全绕过 hooks；修复后统一走
+    ``run_via_stream()`` → ``astream()``，所有 RuntimeHook 都会触发。
+    """
+
+    def test_run_triggers_metrics_hook(self, tmp_settings: Settings):
+        """``runtime.run()`` 触发 MetricsHook：至少能找到 MetricsHook 实例。"""
+        from zgraph.runtime import ZGraphRuntime
+
+        rt = ZGraphRuntime(tmp_settings)
+        # 跑一次 offline run；offline 路径只 yield 一个 Final，没 ContentDelta，
+        # 但 hook 仍会在 Final 上记录 metrics。
+        result = rt.run("hello", run_id="r-hook-1")
+        assert result.run_id == "r-hook-1"
+        # 找到 MetricsHook 实例，验证它存在（之前测试只检查了类型，这里再
+        # 检查 hooks 链确实挂载了）。
+        metrics_hook = next(h for h in rt.hooks if isinstance(h, MetricsHook))
+        assert metrics_hook is not None
+
+    def test_run_writes_audit_json(self, tmp_settings: Settings):
+        """``runtime.run()`` 写 audit.json —— 证明 hook 链生效（AuditHook 触发）。
+
+        之前 ``run()`` 不走 astream，AuditHook 收不到事件，audit.json 不会被
+        AuditHook 写出。现在 run() 走 astream，AuditHook 在 Final 事件上触发。
+        """
+        from zgraph.runtime import ZGraphRuntime
+
+        rt = ZGraphRuntime(tmp_settings)
+        rt.run("audit me", run_id="r-audit-1")
+
+        # audit.json 在 runs/{run_id}/logs/audit.json
+        audit_path = tmp_settings.zgraph_home / "runs" / "r-audit-1" / "logs" / "audit.json"
+        assert audit_path.exists(), f"audit.json not written by AuditHook: {audit_path}"
+        # AuditHook 至少写一条记录（Final 事件触发）
+        lines = [l for l in audit_path.read_text(encoding="utf-8").splitlines() if l.strip()]
+        assert lines, "audit.json is empty"
+        entry = json.loads(lines[-1])
+        assert entry.get("run_id") == "r-audit-1"
+        assert entry.get("status") == "completed"

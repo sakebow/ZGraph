@@ -44,12 +44,14 @@ class TestRuntimeUsesStorageDirNotOutputsAlias:
             "runtime wrote to outputs_dir alias instead of storage_dir"
         )
 
-    def test_run_unprotected_artifacts_come_from_storage_dir(
+    def test_run_artifacts_come_from_storage_dir(
         self, tmp_settings: Settings, sample_png: bytes
     ):
         """runtime.run() 的 artifacts 列表包含 media_store 写入的 PNG。
 
         验证 ``workspace.storage_dir`` 和 ``media_store`` 写到同一棵树。
+        注意：``runtime.run()`` 现在统一走 ``run_via_stream()`` → ``astream()``
+        （hooks 链生效），所以这里直接调公共入口而不是内部 helper。
         """
         rt = ZGraphRuntime(tmp_settings)
 
@@ -65,8 +67,8 @@ class TestRuntimeUsesStorageDirNotOutputsAlias:
             name="artifact.png",
         )
 
-        request = {"user_input": "hi", "run_id": "r-artifacts"}
-        result_dict = rt._run_unprotected(request, workspace)
+        result = rt.run("hi", run_id="r-artifacts")
+        result_dict = result.to_dict()
         artifacts = result_dict.get("artifacts") or []
 
         assert any(a.endswith(str(Path("r-artifacts") / "artifact.png")) for a in artifacts), (

@@ -74,18 +74,38 @@ class AuditHook:
             )
         try:
             target.parent.mkdir(parents=True, exist_ok=True)
-            entry = {
+            # Phase 5.1：把完整 interrupt dict 一起写进 audit.json。
+            # 之前 `interrupt` 字段是 bool，`resume_interrupted()` 读时按 dict 处理会
+            # AttributeError。`interrupt_payload` 是可选字段，仅在确有 interrupt 时写。
+            interrupt_payload: dict[str, Any] | None = None
+            if interrupt and isinstance(interrupt, dict):
+                interrupt_payload = dict(interrupt)
+            # Phase 5.1：把 ``ctx.state`` 完整写进 entry，便于 ``resume_interrupted``
+            # 在 AuditHook 写出的 NDJSON 上恢复状态。AuditHook 不需要 state 时（ctx.state
+            # 为 None），不写这个字段保持向后兼容。
+            entry: dict[str, Any] = {
                 "ts": time.time(),
                 "run_id": event.run_id,
                 "status": status,
                 "content_len": len(content or ""),
                 "reasoning_len": len(reasoning or ""),
                 "interrupt": bool(interrupt),
+                "interrupt_payload": interrupt_payload,
                 "error": error,
                 "media_count": len(media_records),
                 "media": media_records,
                 "metadata_keys": list(ctx.metadata.keys()) if ctx.metadata else [],
             }
+            # Phase 5.8：把 MetricsHook 累计的 metrics 字典也写进 entry。
+            # 之前 metrics 只在 ``ctx.metadata["metrics"]`` 里，没有任何下游消费者
+            # 读它——只有 ``metadata_keys`` 列出 key，但 audit.json 里看不到值。
+            # 真实运行数据被默默丢掉，无法做后续性能/用量分析。
+            metrics_payload = (ctx.metadata or {}).get("metrics") if ctx.metadata else None
+            if isinstance(metrics_payload, dict):
+                # 不复制引用，防止 AuditHook 内部修改污染 caller
+                entry["metrics"] = dict(metrics_payload)
+            if getattr(ctx, "state", None):
+                entry["state"] = dict(ctx.state)
             with target.open("a", encoding="utf-8") as f:
                 f.write(json.dumps(entry, ensure_ascii=False) + "\n")
         except Exception as exc:
